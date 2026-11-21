@@ -1,0 +1,87 @@
+name: CI and production deploy
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: whatsapp-bot-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test bot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run tests
+        run: npm test
+
+  deploy:
+    name: Deploy to alinhamento-bot
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+      GCP_DEPLOYER_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+      GCE_INSTANCE: ${{ vars.GCE_INSTANCE }}
+      GCE_ZONE: ${{ vars.GCE_ZONE }}
+      GCE_OSLOGIN_USER: ${{ vars.GCE_OSLOGIN_USER }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Validate deployment settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in GCP_PROJECT_ID GCP_WIF_PROVIDER GCP_DEPLOYER_SERVICE_ACCOUNT GCE_INSTANCE GCE_ZONE GCE_OSLOGIN_USER; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing GitHub production environment variable: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Authenticate to Google Cloud with short-lived OIDC credentials
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Deploy, verify, and roll back on failure
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud compute ssh "${GCE_OSLOGIN_USER}@${GCE_INSTANCE}" \
+            --project="${GCP_PROJECT_ID}" \
+            --zone="${GCE_ZONE}" \
+            --tunnel-through-iap \
+            --quiet \
+            --command="bash -s -- '${GITHUB_SHA}'" \
+            < scripts/deploy-vm.sh
+
