@@ -76,7 +76,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gcloud compute ssh "${GCE_OSLOGIN_USER}@${GCE_INSTANCE}" \
+          gcloud compute ssh "${GCE_INSTANCE}" \
             --project="${GCP_PROJECT_ID}" \
             --zone="${GCE_ZONE}" \
             --tunnel-through-iap \
