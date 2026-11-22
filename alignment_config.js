@@ -4,10 +4,18 @@ function findHeaderRow(rows, aliases) {
   const allowed = new Set(aliases.map(norm));
   let bestIndex = -1;
   let bestScore = 0;
-  rows.forEach((row, i) => {
+  let bestNonEmpty = 0;
+  const limit = Math.min(rows.length, 15);
+  for (let i = 0; i < limit; i++) {
+    const row = rows[i] || [];
     const score = row.filter(cell => allowed.has(norm(cell))).length;
-    if (score >= bestScore && score > 0) { bestScore = score; bestIndex = i; }
-  });
+    const nonEmpty = row.filter(cell => String(cell || '').trim()).length;
+    if (score > bestScore || (score === bestScore && score > 0 && nonEmpty > bestNonEmpty)) {
+      bestScore = score;
+      bestNonEmpty = nonEmpty;
+      bestIndex = i;
+    }
+  }
   return bestIndex;
 }
 
@@ -33,7 +41,7 @@ async function loadAlignmentConfig(sheets, spreadsheetId) {
   const missing = Object.entries(tabs).filter(([, value]) => !value).map(([key]) => key);
   if (missing.length) throw new Error('Abas de configuração ausentes: ' + missing.join(', '));
   const read = async name => {
-    const { data } = await sheets.spreadsheets.values.get({ spreadsheetId, range: `'${name.replace(/'/g, "''")}'!A1:Z2000` });
+    const { data } = await sheets.spreadsheets.values.get({ spreadsheetId, range: `'${name.replace(/'/g, "''")}'!A1:ZZ5000` });
     return data.values || [];
   };
   const [taxonomyRows, glossaryRows, combinationRows, masterRows] = await Promise.all(Object.values(tabs).map(read));

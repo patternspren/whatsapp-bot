@@ -43,16 +43,26 @@ function createTracker({
 }) {
   let sessions = load() || {};
   const recentContext = {};
-  let queue = Promise.resolve();
+  const groupQueues = new Map();
+  let persistQueue = Promise.resolve();
 
-  const enqueue = (fn) => {
-    const next = queue.then(fn);
-    queue = next.catch(() => {});
+  const enqueueGroup = (group, fn) => {
+    const prev = groupQueues.get(group) || Promise.resolve();
+    const next = prev.then(fn);
+    const settled = next.catch(() => {});
+    groupQueues.set(group, settled);
+    settled.finally(() => {
+      if (groupQueues.get(group) === settled) groupQueues.delete(group);
+    });
     return next;
   };
 
   async function persist() {
-    await save(sessions);
+    if (!save) return;
+    const snapshot = JSON.parse(JSON.stringify(sessions));
+    const next = persistQueue.then(() => save(snapshot));
+    persistQueue = next.catch(() => {});
+    return next;
   }
 
   async function close(group, reason) {
@@ -63,9 +73,10 @@ function createTracker({
     await persist();
   }
 
-  async function expire(t) {
-    for (const [group, session] of Object.entries(sessions)) {
-      if (t - session.lastRelated >= timeoutMs) await close(group, 'inatividade');
+  async function expireGroup(group, t) {
+    const session = sessions[group];
+    if (session && t - session.lastRelated >= timeoutMs) {
+      await close(group, 'inatividade');
     }
   }
 
@@ -75,68 +86,79 @@ function createTracker({
       startedAt: msg.timestamp || new Date(t).toISOString(),
       lastRelated: t,
       activatedByMention: msg.activatedByMention === true,
+      authorizedSender: msg.explicitMention ? msg.senderJid : '',
       messages: [msg]
     };
   }
 
   return {
-    process: (msg) => enqueue(async () => {
-      if (!msg?.group || !String(msg.text || '').trim()) return 'ignorada';
-      const t = now();
-      await expire(t);
+    process: (msg) => {
+      if (!msg?.group || !String(msg.text || '').trim()) return Promise.resolve('ignorada');
+      return enqueueGroup(msg.group, async () => {
+        const t = now();
+        await expireGroup(msg.group, t);
 
-      const session = sessions[msg.group];
-      if (!session) {
-        const context = recentContext[msg.group] || [];
-        const detected = await detect(msg, context);
-        recentContext[msg.group] = [...context, msg].slice(-20);
-        if (!detected) return 'ignorada';
-        sessions[msg.group] = newSession(msg, t);
-        sessions[msg.group].messages = [...context, msg];
-        delete recentContext[msg.group];
-        await onMessage(sessions[msg.group]);
-        await persist();
-        return 'aberta';
-      }
-
-      if (msg.id && session.messages.some((item) => item.id === msg.id)) return 'duplicada';
-      if (msg.activatedByMention === true) session.activatedByMention = true;
-      if (session.messages.length >= maxMessages) {
-        await close(msg.group, 'limite de mensagens');
-        if (await detect(msg)) {
+        const session = sessions[msg.group];
+        if (!session) {
+          const context = recentContext[msg.group] || [];
+          const detected = msg.explicitMention === true || await detect(msg, context);
+          recentContext[msg.group] = [...context, msg].slice(-20);
+          if (!detected) return 'ignorada';
           sessions[msg.group] = newSession(msg, t);
+          sessions[msg.group].messages = [...context, msg];
+          delete recentContext[msg.group];
           await onMessage(sessions[msg.group]);
           await persist();
           return 'aberta';
         }
-        return 'limite atingido';
-      }
 
-      const decision = await classify(session.messages, msg);
-      if (!DECISIONS.has(decision)) throw new Error('Classificação inválida do Gemini');
-      if (decision === 'unrelated') return decision;
+        if (msg.id && session.messages.some((item) => item.id === msg.id)) return 'duplicada';
+        if (msg.activatedByMention === true) session.activatedByMention = true;
+        if (msg.explicitMention && msg.senderJid) session.authorizedSender = msg.senderJid;
+        if (session.messages.length >= maxMessages) {
+          await close(msg.group, 'limite de mensagens');
+          if (msg.explicitMention === true || await detect(msg)) {
+            sessions[msg.group] = newSession(msg, t);
+            await onMessage(sessions[msg.group]);
+            await persist();
+            return 'aberta';
+          }
+          return 'limite atingido';
+        }
 
-      if (decision === 'new_activity') {
-        await close(msg.group, 'novo equipamento');
-        sessions[msg.group] = newSession(msg, t);
-      } else {
-        session.messages.push(msg);
-        if (decision === 'related') session.lastRelated = t;
-      }
-      if (decision !== 'unrelated') await onMessage(sessions[msg.group]);
-      await persist();
-      return decision;
-    }),
-    tick: () => enqueue(async () => {
-      await expire(now());
-      for (const session of Object.values(sessions)) {
-        if (session.lastAnalyzedMessageCount === session.messages.length) continue;
+        let decision = await classify(session.messages, msg);
+        if (msg.explicitMention === true && decision === 'unrelated') decision = 'uncertain';
+        if (!DECISIONS.has(decision)) throw new Error('Classificação inválida do Gemini');
+        if (decision === 'unrelated') return decision;
+
+        if (decision === 'new_activity') {
+          const authorizedSender = session.authorizedSender;
+          await close(msg.group, 'novo equipamento');
+          sessions[msg.group] = newSession(msg, t);
+          sessions[msg.group].authorizedSender ||= authorizedSender;
+        } else {
+          session.messages.push(msg);
+          if (decision === 'related') session.lastRelated = t;
+        }
+        if (decision !== 'unrelated') await onMessage(sessions[msg.group]);
+        await persist();
+        return decision;
+      });
+    },
+    tick: async () => {
+      const groups = Object.keys(sessions);
+      await Promise.all(groups.map(group => enqueueGroup(group, async () => {
+        await expireGroup(group, now());
+        const session = sessions[group];
+        if (!session || session.lastAnalyzedMessageCount === session.messages.length) return;
         const synced = await onTick(session);
-        if (synced !== false) session.lastAnalyzedMessageCount = session.messages.length;
-      }
-      await persist();
-    }),
-    clearGroup: (group) => enqueue(async () => {
+        if (synced !== false) {
+          session.lastAnalyzedMessageCount = session.messages.length;
+          await persist();
+        }
+      })));
+    },
+    clearGroup: (group) => enqueueGroup(group, async () => {
       delete sessions[group];
       delete recentContext[group];
       await persist();
@@ -171,7 +193,7 @@ async function geminiJson(apiKey, prompt, model = 'gemini-3.1-flash-lite', media
   const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
     encodeURIComponent(model) + ':generateContent';
   const timeoutMs = 50000;
-  const maxAttempts = 2;
+  const maxAttempts = 3;
   let lastError;
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
@@ -198,15 +220,21 @@ async function geminiJson(apiKey, prompt, model = 'gemini-3.1-flash-lite', media
       }
 
       const json = await response.json();
-      const text = json.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('');
-      if (!text) throw new Error('Gemini retornou resposta vazia');
-      return JSON.parse(text);
+      const candidate = json.candidates?.[0];
+      const rawText = candidate?.content?.parts?.map((part) => part.text || '').join('');
+      if (!rawText) {
+        const reason = candidate?.finishReason ? ` (${candidate.finishReason})` : '';
+        throw new Error('Gemini retornou resposta vazia' + reason);
+      }
+      const cleaned = rawText.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+      return JSON.parse(cleaned);
     } catch (error) {
       lastError = error.name === 'AbortError'
         ? new Error('Tempo limite do Gemini após ' + Math.round(timeoutMs / 1000) + ' segundos')
         : error;
       const retryable = error.name === 'AbortError' ||
         error.name === 'TypeError' ||
+        error instanceof SyntaxError ||
         [408, 429, 500, 502, 503, 504].includes(error.status);
 
       if (!retryable || attempt + 1 >= maxAttempts) throw lastError;
@@ -221,7 +249,7 @@ async function geminiJson(apiKey, prompt, model = 'gemini-3.1-flash-lite', media
 }
 
 function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema = async () => ({}) }) {
-  const configContext = async () => JSON.stringify(await config || {});
+  const configContext = async () => JSON.stringify((typeof config === 'function' ? await config() : await config) || {});
   async function detect(message, context = []) {
     const result = await geminiJson(apiKey, [
       'Identifique pelo contexto se a conversa descreve uma atividade de alinhamento de máquinas ou eixos, mesmo sem usar a palavra alinhamento.',
@@ -256,16 +284,41 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
       ? result[0].records : Array.isArray(result) ? result : result?.records;
     if (!Array.isArray(records)) return typeof result?.summary === 'string' ? result.summary.trim() : '';
     const fold = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
-    const validTitles = new Map(schema.filter(col => col.mappedAs?.length).map(col => [fold(col.title), col.title]));
+    const mappedColumns = schema.filter(col => col.mappedAs?.length);
+    const titleCounts = new Map();
+    for (const col of mappedColumns) {
+      const base = fold(col.title);
+      titleCounts.set(base, (titleCounts.get(base) || 0) + 1);
+    }
+    const validTitles = new Map();
+    for (const col of mappedColumns) {
+      const base = fold(col.title);
+      const count = titleCounts.get(base) || 0;
+      const displayTitle = count > 1 && col.group ? `${col.title} (${col.group})` : col.title;
+      if (count > 1 && col.group) {
+        validTitles.set(fold(`${col.title} (${col.group})`), displayTitle);
+      }
+      if (!validTitles.has(base)) validTitles.set(base, col.title);
+    }
     // A legenda da pessoa e a tela são fontes independentes. Em caso de divergência,
     // preserve o registro parcial e sinalize o campo em vez de gravar um número incerto.
     if (/^image\//i.test(mimeType) && caption) {
       const names = { 'axial vertical':'Axial Vertical', 'radial vertical':'Radial Vertical',
         'axial horizontal':'Axial Horizontal', 'radial horizontal':'Radial Horizontal' };
+      const normUnit = unit => {
+        const u = String(unit || '').trim().toLowerCase().replace('μm', 'µm');
+        if (u === 'um') return 'µm';
+        if (u === 'mil') return 'mils';
+        return u;
+      };
+      const SUPPORTED_UNITS = new Set(['mm', 'cm', 'µm', 'mils', 'in', 'pol']);
       const labeled = new Map();
       const disagreements = [];
-      for (const match of caption.matchAll(/\b(axial|radial)\s+(vertical|horizontal)\s*:\s*([+-]?\d+(?:[.,]\d+)?)/gi)) {
-        labeled.set(names[fold(match[1] + ' ' + match[2])], match[3]);
+      for (const match of caption.matchAll(/\b(axial|radial)\s+(vertical|horizontal)\s*:\s*([+-]?\d+(?:[.,]\d+)?)(?:\s*(mm|cm|µm|μm|um|mils?|in|pol))?/gi)) {
+        labeled.set(names[fold(match[1] + ' ' + match[2])], {
+          raw: match[3],
+          unit: match[4] ? normUnit(match[4]) : ''
+        });
       }
       if (labeled.size) {
         const pictureFields = new Set(Object.keys(names).map(fold));
@@ -280,34 +333,47 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
             'Retorne JSON {"compatible":true,"unit":"mm","values":{"Axial Vertical":"0.12","Radial Vertical":"-0.07","Axial Horizontal":"0.04","Radial Horizontal":"-0.03"}}. unit deve ser a unidade visível na tela. Se não houver tela legível, retorne compatible false e values vazio.'
           ].join('\n'), model, [{ mimeType, data }]);
           const visual = Array.isArray(reading) && reading.length === 1 ? reading[0] : reading;
+          const visualUnit = normUnit(visual?.unit);
           const number = value => {
             if (typeof value !== 'string' && typeof value !== 'number') return null;
-            const match = String(value).trim().match(/^([+-]?\d+(?:[.,]\d+)?)(?:\s*mm)?$/i);
+            const match = String(value).trim().match(/^([+-]?\d+(?:[.,]\d+)?)(?:\s*(?:mm|cm|µm|μm|um|mils?|in|pol))?$/i);
             return match ? Number(match[1].replace(',', '.')) : null;
           };
-          if (visual?.compatible === true && visual.unit === 'mm') {
-            for (const [title, value] of labeled) {
+          if (visual?.compatible === true && SUPPORTED_UNITS.has(visualUnit)) {
+            for (const [title, item] of labeled) {
+              const captionUnit = item.unit || visualUnit;
               const seen = number(visual.values?.[title]);
-              if (seen === null || seen !== number(value)) {
+              if (seen === null || captionUnit !== visualUnit || seen !== number(item.raw)) {
                 console.warn('Divergência entre legenda e tela:', title);
-                disagreements.push({field:title, caption:value + ' mm', visual:seen === null ? null : String(seen) + ' mm'});
+                disagreements.push({
+                  field: title,
+                  caption: `${item.raw} ${captionUnit}`,
+                  visual: seen === null ? null : `${seen} ${visualUnit}`
+                });
                 continue;
               }
               if (!validTitles.has(fold(title)) || records.length !== 1) continue;
-              records[0].facts.push({field:validTitles.get(fold(title)), value:`${value} mm`,
-                evidence:`Legenda validada na tela: ${title.toLowerCase()}: ${value} mm`});
+              records[0].facts.push({
+                field: validTitles.get(fold(title)),
+                value: `${item.raw} ${captionUnit}`,
+                evidence: `Legenda validada na tela: ${title.toLowerCase()}: ${item.raw} ${captionUnit}`
+              });
             }
           } else {
-            for (const [title,value] of labeled) disagreements.push({field:title, caption:value + ' mm', visual:null});
+            for (const [title, item] of labeled) {
+              disagreements.push({ field: title, caption: `${item.raw} ${item.unit || 'mm'}`, visual: null });
+            }
           }
         } catch (error) {
-          for (const [title,value] of labeled) disagreements.push({field:title, caption:value + ' mm', visual:null});
+          for (const [title, item] of labeled) {
+            disagreements.push({ field: title, caption: `${item.raw} ${item.unit || 'mm'}`, visual: null });
+          }
           console.warn('Validação da imagem indisponível:', error.message);
         }
       }
       if (records.length === 1 && disagreements.length) records[0].disagreements = disagreements;
     }
-    if (mimeType === 'application/pdf' && records.length && validTitles.has('data')) {
+    if (mimeType === 'application/pdf' && records.length && (validTitles.has('data') || validTitles.has('date'))) {
       try {
         const result = await geminiJson(apiKey, [
           'Examine o relatório inteiro e identifique o período geral de execução que abrange explicitamente os equipamentos identificados.',
@@ -321,9 +387,9 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
             fold(period.evidence).includes(fold(period.value))) {
           for (const record of records) {
             record.facts = Array.isArray(record.facts) ? record.facts : [];
-            if (!record.facts.some(fact => fold(fact.field) === 'data' && typeof fact.value === 'string' &&
+            if (!record.facts.some(fact => ['data', 'date'].includes(fold(fact.field)) && typeof fact.value === 'string' &&
                 typeof fact.evidence === 'string' && fold(fact.evidence).includes(fold(fact.value)))) {
-              record.facts.push({field:'Data', value:period.value,
+              record.facts.push({field: validTitles.get('data') || validTitles.get('date') || 'Data', value:period.value,
                 evidence:`Período geral do serviço: ${period.evidence} (página ${period.page || 'não indicada'})`});
             }
           }
@@ -340,7 +406,12 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
           'Retorne JSON {"records":[{"equipment":"nome literal","coupling_gap":{"value":"número e unidade","evidence":"citação textual com o mesmo número e unidade","page":1}}]}. Use null se não houver medida final clara.',
           'EQUIPAMENTOS IDENTIFICADOS: ' + JSON.stringify(records.map(record => record.equipment))
         ].join('\n'), model, [{ mimeType, data }]);
-        const key = value => fold(value).replace(/\b(?:diesel generator|gerador diesel|grupo gerador|genset|dg)\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
+        const key = value => fold(value)
+          .replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset|dg)\s*#?\s*0*(\d+)\b/g, 'dg$1')
+          .replace(/\b(?:motor de combustao principal|motor principal|main engine|mcp)(?:\s*#?\s*0*(\d+))?\b/g, (_, num) => num ? `mcp${num}` : 'mcp')
+          .replace(/\b(?:bombordo|portside|port)\b/g, 'bb')
+          .replace(/\b(?:boreste|starboard|stbd)\b/g, 'be')
+          .replace(/[^a-z0-9]/g, '');
         const byEquipment = new Map(records.map(record => [key(record.equipment), record]));
         for (const item of supplemental?.records || []) {
           const match = byEquipment.get(key(item.equipment));
@@ -407,7 +478,24 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
   async function finish(session, reason) {
     const reportIndex = session.messages.findIndex(message =>
       String(message.text || '').includes('Conteúdo lido do anexo:'));
-    const relevantMessages = reportIndex >= 0 ? session.messages.slice(reportIndex) : session.messages;
+    let relevantMessages = session.messages;
+    if (reportIndex > 0) {
+      const reportTime = Date.parse(session.messages[reportIndex].timestamp || '');
+      const hasContextCue = message => {
+        if (message.explicitMention === true) return true;
+        const body = String(message.originalText || message.text || '').replace(/^\[Grupo:[^\]]*\]\s*/i, '');
+        return /(?:^|\n)\s*[A-Za-zÀ-ÿ][^:\n]{1,35}:\s*\S/m.test(body) ||
+          /\b(?:embarca[cç][aã]o|navio|vessel|equipamento|equipment|mcp|dg|gerador|bomba|motivo|motiva[cç][aã]o|executor|respons[aá]vel|m[eé]todo|data|alinhamento|alignment|toler[aâ]ncia|tolerance|coupling|gap|laser|mm|µm|um|mils|bombordo|boreste|port|stbd|starboard)\b/i.test(body);
+      };
+      const preAttachment = session.messages.slice(0, reportIndex).filter(message => {
+        const msgTime = Date.parse(message.timestamp || '');
+        if (Number.isFinite(reportTime) && Number.isFinite(msgTime) && reportTime - msgTime > 2 * 60 * 60 * 1000) {
+          return false;
+        }
+        return hasContextCue(message);
+      });
+      relevantMessages = [...preAttachment, ...session.messages.slice(reportIndex)];
+    }
     const transcript = relevantMessages.map((message, index) => ({
       n: index + 1,
       time: message.timestamp,
@@ -418,7 +506,7 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
       'Extraia um registro de alinhamento POR equipamento distinto. Responda JSON {"records":[{"status":"ready|ambiguous|incomplete","vessel":{"value":"texto literal","message":1,"quote":"trecho literal"},"equipment":{"value":"texto literal","message":1,"quote":"trecho literal"},"fields":{"equipment_class":null,"maker":null,"model":null,"stationary_equipment_class":null,"stationary_maker":null,"stationary_model":null,"date":null,"motivation":null,"executor":null,"method":null,"axial_vertical":null,"axial_horizontal":null,"radial_vertical":null,"radial_horizontal":null,"coupling_gap":null,"standard":null,"axial_tolerance":null,"radial_tolerance":null,"coupling_gap_tolerance":null,"document":null,"measurement_unit":null,"axial_vertical_before":null,"axial_horizontal_before":null,"radial_vertical_before":null,"radial_horizontal_before":null}}]}.',
       'Use o título do grupo como evidência contextual da embarcação. Use a configuração online (taxonomia, glossário e combinações) para reconhecer nomes alternativos. equipment é a identificação do conjunto alinhado, não uma classe genérica.',
       'Compare a conversa com os cabeçalhos reais da planilha a seguir. Mapeie apenas para campos que existam nesses cabeçalhos e respeite o grupo dos títulos repetidos. Cabeçalhos sem correspondência permanecem sem informação.',
-      'Extraia apenas valores que as mensagens afirmam explicitamente. Mantenha tolerâncias separadas de medições. Registre medições após ajuste nas quatro direções apenas quando isso estiver explícito; medições anteriores ficam nos campos *_before. Não calcule, converta, complete, atribua autoria nem adivinhe dados ausentes.',
+      'Extraia apenas valores que as mensagens afirmam explicitamente. Preserve datas parciais sem acrescentar ano. Mantenha tolerâncias separadas de medições. Registre medições após ajuste nas quatro direções apenas quando isso estiver explícito; medições anteriores ficam nos campos *_before. Não calcule, converta, complete, atribua autoria nem adivinhe dados ausentes.',
       'Cada valor não nulo precisa apontar para o número da mensagem e conter uma quote literal daquela mensagem que inclua o valor. Use incomplete quando faltarem campos. Use ambiguous somente para o registro cuja identidade ou associação for incerta. Não descarte outros equipamentos claros.',
       'Use status ready somente quando vessel, equipment e ao menos um campo de histórico estiverem claros. Use as grafias e unidades originais.',
       'MOTIVO DE FECHAMENTO: ' + reason,
@@ -453,16 +541,38 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
 function verifyExtraction(result, transcript) {
   if (!result || !['ready', 'incomplete'].includes(result.status)) return { ok: false, reason: 'extração ambígua' };
   const fold = (value) => String(value).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase();
-  const verifiedValue = (item) => {
+  const normalizeWs = value => fold(value).replace(/\s+/g, ' ').trim();
+  const normalizeNumExpr = value => normalizeWs(value).replace(/(\d),(\d)/g, '$1.$2').replace(/(\d)\s*(mm|cm|µm|μm|um|mils?|in|pol)\b/gi, '$1 $2');
+  const eqNorm = value => normalizeWs(value)
+    .replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset|dg)\s*#?\s*0*(\d+)\b/g, 'dg$1')
+    .replace(/\b(?:motor de combustao principal|motor principal|main engine|mcp)(?:\s*#?\s*0*(\d+))?\b/g, (_, num) => num ? `mcp${num}` : 'mcp')
+    .replace(/\b(?:bombordo|portside|port)\b/g, 'bb')
+    .replace(/\b(?:boreste|starboard|stbd)\b/g, 'be')
+    .replace(/[^a-z0-9]/g, '');
+  const genericEntityTokens = new Set(['bram', 'navio', 'embarcacao', 'vessel', 'grupo', 'group', 'psv', 'ahts', 'osrv', 'rsv', 'lh']);
+  const verifiedValue = (item, { matchEquipment = false, matchEntity = false } = {}) => {
     if (!item || typeof item.value !== 'string' || !item.value.trim() ||
         !Number.isInteger(item.message) || item.message < 1 || item.message > transcript.length ||
         typeof item.quote !== 'string' || !item.quote.trim()) return null;
     const source = transcript[item.message - 1].text;
-    if (!source.includes(item.quote) || !fold(item.quote).includes(fold(item.value))) return null;
-    return item.value.trim();
+    const quoteInSource = source.includes(item.quote) || normalizeWs(source).includes(normalizeWs(item.quote));
+    if (!quoteInSource) return null;
+    const valueText = item.value.trim();
+    const direct = fold(item.quote).includes(fold(valueText)) ||
+      normalizeNumExpr(item.quote).includes(normalizeNumExpr(valueText));
+    if (direct) return valueText;
+    if (matchEquipment) {
+      const targetEq = eqNorm(valueText);
+      if (targetEq && eqNorm(item.quote).includes(targetEq)) return valueText;
+    }
+    if (matchEntity) {
+      const distinctive = normalizeWs(valueText).split(/[^a-z0-9]+/).filter(t => t.length >= 4 && !genericEntityTokens.has(t));
+      const quoteWords = new Set(normalizeWs(item.quote).split(/[^a-z0-9]+/).filter(Boolean));
+      if (distinctive.length && distinctive.every(t => quoteWords.has(t))) return valueText;
+    }
+    return null;
   };
 
-  const vessel = verifiedValue(result.vessel) || 'não informado';
   const sections = transcript.flatMap((message, messageIndex) => {
     const marker = 'Conteúdo lido do anexo:';
     const text = String(message.text || '');
@@ -475,24 +585,50 @@ function verifyExtraction(result, transcript) {
   // Isso evita usar o primeiro anexo histórico para identificar a atividade atual.
   const latestMessageIndex = sections.length ? sections[sections.length - 1].messageIndex : -1;
   const latestSections = sections.filter(section => section.messageIndex === latestMessageIndex);
+  const vesselNames = [...new Set(latestSections.flatMap(({ text }) => {
+    const match = text.match(/^\s*Embarca[cç][aã]o:\s*(.+)$/im);
+    return match && match[1].trim() ? [match[1].trim()] : [];
+  }))];
+  const vessel = verifiedValue(result.vessel, { matchEntity: true }) || (vesselNames.length === 1 ? vesselNames[0] : 'não informado');
   const names = [...new Set(latestSections.flatMap(({text}) => {
     const match = text.match(/^\s*Equipamento:\s*(.+)$/im);
     return match && match[1].trim() ? [match[1].trim()] : [];
   }))];
-  const verifiedEquipment = verifiedValue(result.equipment);
+  const verifiedEquipment = verifiedValue(result.equipment, { matchEquipment: true });
   const equipment = verifiedEquipment || (names.length === 1 ? names[0] : 'não informado');
+
+  const LABEL_ALIASES = {
+    'Data': ['Data', 'Date'],
+    'Maker': ['Maker', 'Fabricante'],
+    'Model': ['Model', 'Modelo'],
+    'Stationary Maker': ['Stationary Maker', 'Maker (Máquina Estacionária)'],
+    'Stationary Model': ['Stationary Model', 'Model (Máquina Estacionária)'],
+    'Stationary Equipment Class': ['Stationary Equipment Class', 'Equipment Class (Máquina Estacionária)'],
+    'Equipment Class': ['Equipment Class', 'Equipment Class (Drive Machine)'],
+    'Motivacao': ['Motivacao', 'Motivação', 'Motivation', 'Motivo'],
+    'Executor': ['Executor', 'Responsavel', 'Responsável'],
+    'Metodo': ['Metodo', 'Método', 'Method'],
+    'Document': ['Document', 'Documento']
+  };
+  const labelForms = label => (LABEL_ALIASES[label] || [label]).map(fold);
 
   // Gemini por vezes simplifica um campo para string. Só aceita esse formato
   // quando a mesma medida aparece com o cabeçalho na seção do equipamento.
   const verifiedString = (value, label) => {
     if (typeof value !== 'string' || !value.trim() || equipment === 'não informado') return null;
     const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`(?:^|\\n)${escape(fold(label))}:\\s*${escape(fold(value.trim()))}(?=\\s*\\(|\\s*$)`, 'm');
-    for (const {text:section} of latestSections) {
-      const normalized = fold(section);
-      if (normalized.includes(`equipamento: ${fold(equipment)}`) && pattern.test(normalized)) return value.trim();
-    }
-    return null;
+    const forms = labelForms(label).map(escape).join('|');
+    const pattern = new RegExp(`(?:^|\\n)(?:${forms}):\\s*${escape(fold(value.trim()))}(?=\\s*\\(|\\s*$)`, 'm');
+    const checkSections = (list) => {
+      for (const { text: section } of list) {
+        const normalized = fold(section);
+        const eqMatch = section.match(/^\s*Equipamento:\s*(.+)$/im);
+        const sameEq = Boolean(eqMatch) && (fold(eqMatch[1].trim()) === fold(equipment) || eqNorm(eqMatch[1]) === eqNorm(equipment));
+        if (sameEq && pattern.test(normalized)) return value.trim();
+      }
+      return null;
+    };
+    return checkSections(latestSections) || checkSections(sections);
   };
 
   const fields = {};
@@ -500,17 +636,27 @@ function verifyExtraction(result, transcript) {
     const value = verifiedValue(result.fields?.[key]) || verifiedString(result.fields?.[key], label);
     if (value) fields[label] = value;
   }
-  if (equipment !== 'não informado' && names.length === 1 && fold(names[0]) === fold(equipment)) {
-    for (const [key, label] of Object.entries(FIELD_LABELS)) {
-      if (fields[label]) continue;
-      const candidates = latestSections.flatMap(({text:section}) => section.split('\n').flatMap(line => {
-        const match = line.match(/^([^:]+):\s*(.*?)\s+\(fonte:\s*(.+)\)$/i);
-        if (!match || fold(match[1].trim()) !== fold(label) || !match[2].trim()) return [];
-        return fold(match[3]).includes(fold(match[2])) ? [match[2].trim()] : [];
-      }));
-      const unique = [...new Set(candidates)];
-      if (unique.length === 1) fields[label] = unique[0];
-    }
+  if (equipment !== 'não informado' && names.length === 1 && eqNorm(names[0]) === eqNorm(equipment)) {
+    const matchingSections = sections.filter(({ text }) => {
+      const eqMatch = text.match(/^\s*Equipamento:\s*(.+)$/im);
+      return eqMatch && eqNorm(eqMatch[1]) === eqNorm(equipment);
+    });
+    const collectFrom = (list) => {
+      for (const [key, label] of Object.entries(FIELD_LABELS)) {
+        if (fields[label]) continue;
+        const allowedLabels = new Set(labelForms(label));
+        const candidates = list.flatMap(({ text: section }) => section.split('\n').flatMap(line => {
+          const match = line.match(/^([^:]+):\s*(.*?)\s+\(fonte:\s*(.+)\)$/i);
+          if (!match || !allowedLabels.has(fold(match[1].trim())) || !match[2].trim()) return [];
+          return fold(match[3]).includes(fold(match[2])) || normalizeNumExpr(match[3]).includes(normalizeNumExpr(match[2]))
+            ? [match[2].trim()] : [];
+        }));
+        const unique = [...new Set(candidates)];
+        if (unique.length === 1) fields[label] = unique[0];
+      }
+    };
+    collectFrom(latestSections);
+    if (matchingSections.length) collectFrom(matchingSections);
   }
   const input = [`Vessel: ${vessel}`, `Equipment: ${equipment}`];
   for (const [label, value] of Object.entries(fields)) input.push(`${label}: ${value}`);

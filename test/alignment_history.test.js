@@ -28,8 +28,24 @@ function fakeSheet(...records) {
   const find = (data, session) => resolveRecordTarget(sheets, 'test', data, session);
   const write = (data, session, target, confirmationId = 'validado') =>
     recordHistory(sheets, 'test', data, session, { target, confirmationId });
-  return { rows, writes, find, write };
+  return { rows, writes, find, write, sheets };
 }
+
+test('não declara sucesso quando a leitura posterior diverge da gravação', async () => {
+  const h = fakeSheet(['BRAM Atlas', 'DG 1', '', '', '0.3 mm', '']);
+  const data = {vessel:'BRAM Atlas', equipment:'DG 1', axial_vertical:'-0.01 mm'};
+  const {target} = await h.find(data, 'sessao');
+  h.sheets.spreadsheets.values.batchUpdate = async () => ({});
+  await assert.rejects(h.write(data, 'sessao', target), /não verificada/);
+});
+
+test('linha da embarcação sem identificação do equipamento impede destino automático', async () => {
+  const h = fakeSheet(['Joe Griffin', '', 'cat', '', '', '']);
+  const result = await h.find({vessel:'Joe Griffin', equipment:'MCP x shaftline'}, 'sessao');
+  assert.equal(result.status, 'ambiguous_target');
+  assert.deepEqual(result.rows, [3]);
+  assert.equal(h.writes.length, 0);
+});
 
 test('atualiza a linha existente do mesmo equipamento mesmo depois de várias horas', async () => {
   const h = fakeSheet(['BRAM Atlas', 'DG 1', 'WEG', '18/11/2026', '0.3 mm', 'Nota anterior', '=1+2']);
@@ -58,10 +74,10 @@ test('só cria linha depois da confirmação de outro equipamento e evita duplic
   assert.equal(h.writes.length, 1);
 });
 
-test('equipamento diferente na mesma embarcação aguarda o intervalo, mas o mesmo atualiza', async () => {
+test('equipamento diferente na mesma embarcação pode ser registrado imediatamente', async () => {
   const h = fakeSheet(['BRAM Atlas', 'DG 1', '', '', '', `recorded_at:${new Date().toISOString()}`]);
   const vessel = 'BRAM Atlas';
-  assert.equal((await h.find({vessel, equipment:'DG 2'}, 'outra')).status, 'too_recent');
+  assert.equal((await h.find({vessel, equipment:'DG 2'}, 'outra')).target.row, null);
   assert.equal((await h.find({vessel, equipment:'DG 1'}, 'atual')).target.row, 3);
   assert.equal((await h.find({vessel:'BRAM Brasil', equipment:'DG 2'}, 'outra')).target.row, null);
   assert.equal(h.writes.length, 0);

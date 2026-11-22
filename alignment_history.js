@@ -1,11 +1,13 @@
 const { createHash } = require('node:crypto');
 
 const TAB = "'Modelo alinhamento'";
-const NEW_EQUIPMENT_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const normalize = value => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().replace(/\s+/g, ' ').toLowerCase();
 const isKnown = value => !['', 'nao informado', 'desconhecido'].includes(normalize(value));
 const equipmentIdentity = value => normalize(value)
-  .replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset|dg)\s*#?\s*(\d+)\b/g, 'dg$1')
+  .replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset|dg)\s*#?\s*0*(\d+)\b/g, 'dg$1')
+  .replace(/\b(?:motor de combustao principal|motor principal|main engine|mcp)(?:\s*#?\s*0*(\d+))?\b/g, (_, num) => num ? `mcp${num}` : 'mcp')
+  .replace(/\b(?:bombordo|portside|port)\b/g, 'bb')
+  .replace(/\b(?:boreste|starboard|stbd)\b/g, 'be')
   .replace(/[^a-z0-9]/g, '');
 const sameEquipment = (first, second) =>
   normalize(first.vessel) === normalize(second.vessel) && equipmentIdentity(first.equipment) === equipmentIdentity(second.equipment);
@@ -80,15 +82,28 @@ function describeColumns(groups, headers, cols) {
 
 
 const markerParts = value => String(value ?? '').split(/\s*\|\s*/).filter(Boolean);
-const userComments = value => markerParts(value).filter(part => !/^(?:session|confirmation|group|recorded_at):/i.test(part)).join(' | ');
+const userComments = value => markerParts(value).filter(part => !/^(?:session|confirmation|group|recorded_at|approved_by):/i.test(part)).join(' | ');
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
-function dateIdentity(value) {
+function singleDateIdentity(value) {
   const text = String(value ?? '').trim();
   const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|T)/);
   if (iso) return iso.slice(1).join('-');
-  const local = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  const local = text.match(/^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})$/);
   return local ? [local[3], local[2].padStart(2, '0'), local[1].padStart(2, '0')].join('-') : '';
+}
+
+function dateIdentity(value) {
+  const text = String(value ?? '').trim();
+  const single = singleDateIdentity(text);
+  if (single) return single;
+  const dates = text.match(/\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/.\-]\d{1,2}[/.\-]\d{4})\b/g);
+  if (dates?.length === 2) {
+    const start = singleDateIdentity(dates[0]);
+    const end = singleDateIdentity(dates[1]);
+    if (start && end) return `${start}..${end}`;
+  }
+  return '';
 }
 
 async function readHistory(sheets, spreadsheetId) {
@@ -109,16 +124,13 @@ function selectRecordTarget(history, data, sessionId) {
   if (!isKnown(data.vessel) || !isKnown(data.equipment) || !equipment) return { status: 'identity_missing' };
   const candidates = [];
   const sessions = [];
-  let newestRecord = -Infinity;
+  const unidentified = [];
   for (let index = 2; index < rows.length; index++) {
     const row = rows[index];
     const parts = markerParts(row[cols.comments]);
     if (normalize(row[cols.vessel]) === vessel) {
       if (equipmentIdentity(row[cols.equipment]) === equipment) candidates.push(index);
-      for (const part of parts.filter(value => value.startsWith('recorded_at:'))) {
-        const recordedAt = Date.parse(part.slice('recorded_at:'.length));
-        if (Number.isFinite(recordedAt)) newestRecord = Math.max(newestRecord, recordedAt);
-      }
+      if (!isKnown(row[cols.equipment])) unidentified.push(index);
     }
     if (parts.includes(`session:${sessionId}`)) sessions.push(index);
   }
@@ -136,8 +148,8 @@ function selectRecordTarget(history, data, sessionId) {
     if (matches.length !== 1) return { status: 'ambiguous_target', rows: candidates.map(i => i + 1) };
     [index] = matches;
   }
-  if (index === undefined && Date.now() - newestRecord < NEW_EQUIPMENT_INTERVAL_MS) {
-    return { status: 'too_recent' };
+  if (index === undefined && unidentified.length) {
+    return {status: 'ambiguous_target', rows: unidentified.map(i => i + 1)};
   }
 
   const current = index === undefined ? {} : Object.fromEntries(
@@ -176,7 +188,13 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { target, c
   const { row, current } = selected.target;
   const commentParts = markerParts(current.comments);
   const observations = String(data.observations || '').replaceAll('|', '¦').trim();
-  for (const part of [observations && `Observações: ${observations}`, `session:${sessionId}`, marker]) {
+  for (const part of [
+    observations && `Observações: ${observations}`,
+    `session:${sessionId}`,
+    marker,
+    data.groupJid && `group:${data.groupJid}`,
+    data.approvedBy && `approved_by:${data.approvedBy}`
+  ]) {
     if (part && !commentParts.includes(part)) commentParts.push(part);
   }
   if (row === null) commentParts.push(`recorded_at:${new Date().toISOString()}`);
@@ -196,12 +214,18 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { target, c
   if (row === null) {
     const newValues = Array(headers.length).fill('');
     for (const { column, value } of values) newValues[column] = value;
+    const mappedCols = Object.values(cols);
+    const firstCol = mappedCols.length ? Math.min(...mappedCols) : 0;
     const { data: appended } = await sheets.spreadsheets.values.append({
-      spreadsheetId, range: `${TAB}!A2:${columnLetter(headers.length)}`,
-      valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: [newValues] }
+      spreadsheetId, range: `${TAB}!${columnLetter(firstCol + 1)}2:${columnLetter(headers.length)}`,
+      valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: [newValues.slice(firstCol)] }
     });
     const updatedRange = appended.updates?.updatedRange;
-    return { status: 'appended', row: Number(updatedRange?.match(/!\$?[A-Z]+\$?(\d+)/)?.[1]) || undefined };
+    const rowNumber = Number(updatedRange?.match(/!\$?[A-Z]+\$?(\d+)/)?.[1]) || undefined;
+    const verified = await readHistory(sheets, spreadsheetId);
+    const actual = rowNumber && verified.rows[rowNumber - 1];
+    if (!actual || values.some(({column, value}) => String(actual[column] ?? '') !== String(value))) throw new Error('Gravação não verificada na planilha');
+    return { status: 'appended', row: rowNumber };
   }
 
   await sheets.spreadsheets.values.batchUpdate({
@@ -213,6 +237,9 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { target, c
       }))
     }
   });
+  const verified = await readHistory(sheets, spreadsheetId);
+  const actual = verified.rows[row - 1];
+  if (!actual || values.some(({column, value}) => String(actual[column] ?? '') !== String(value))) throw new Error('Gravação não verificada na planilha');
   return { status: 'updated', row };
 }
 

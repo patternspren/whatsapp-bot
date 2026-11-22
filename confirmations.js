@@ -11,13 +11,13 @@ const FIELDS = {
   'maker':'maker', 'fabricante':'maker', 'model':'model', 'modelo':'model',
   'stationary equipment class':'stationary_class', 'stationary maker':'stationary_maker',
   'stationary model':'stationary_model', 'data':'date', 'date':'date',
-  'motivacao':'motivation', 'motivation':'motivation',
+  'motivacao':'motivation', 'motivation':'motivation', 'motivo':'motivation',
   'executor':'executor', 'responsavel':'executor', 'método':'method', 'metodo':'method',
   'method':'method', 'coupling gap':'coupling_gap', 'gap':'coupling_gap',
   'padrão':'standard', 'padrao':'standard', 'standard':'standard',
   'axial tolerance':'axial_tolerance', 'radial tolerance':'radial_tolerance',
   'coupling gap tolerance':'gap_tolerance', 'document':'document', 'documento':'document',
-  'comments':'observations', 'observações':'observations', 'observacao':'observations'
+  'comments':'observations', 'observações':'observations', 'observacoes':'observations', 'observação':'observations', 'observacao':'observations'
 };
 
 const fold = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
@@ -26,7 +26,18 @@ const FIELD_KEYS = Object.fromEntries(Object.entries(FIELDS).map(([label, key]) 
 function createConfirmations(file) {
   let state = {};
   try { state = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  function prune() {
+    const keys = Object.keys(state);
+    if (keys.length <= 500) return;
+    const removable = keys
+      .filter(k => state[k]?.status === 'superseded')
+      .sort((a, b) => (state[a]?.createdAt || 0) - (state[b]?.createdAt || 0));
+    while (Object.keys(state).length > 500 && removable.length) {
+      delete state[removable.shift()];
+    }
+  }
   function save() {
+    prune();
     const tmp = file + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(state), {mode:0o600});
     fs.renameSync(tmp, file);
@@ -42,7 +53,7 @@ function createConfirmations(file) {
       if (!proposal.parentKey && proposal.sourceVersion && Object.values(state).some(item =>
         item.group === group && item.sessionId === sessionId && item.sourceVersion === proposal.sourceVersion &&
         (item.status === 'answered' || (item.parentKey && item.status === 'sent')))) return null;
-      state[key] = {...proposal, group, sessionId, status:'prepared'};
+      state[key] = {...proposal, group, sessionId, status:'prepared', createdAt: proposal.createdAt || Date.now()};
       save();
       return {key, text:proposal.text};
     },
@@ -60,10 +71,12 @@ function createConfirmations(file) {
     lookup(group, quotedId) {
       return Object.entries(state).find(([,v]) => v.group===group && v.messageId===quotedId && ['sent','answered','superseded'].includes(v.status)) || null;
     },
-    done(key, responseId, status='answered') {
+    done(key, responseId, status='answered', approvedBy='') {
       if (!state[key]) return;
       state[key].status=status;
       state[key].responseId=responseId;
+      if (approvedBy) state[key].approvedBy = approvedBy;
+      state[key].answeredAt = Date.now();
       save();
     }
   };
@@ -119,4 +132,4 @@ function isApproval(text) {
   return /^(?:(?:sim|ok|confirmo|confirmado|correto|corretos|certo|certa|aprovado|aprovada)(?:[,;:\s]+(?:sim|ok|confirmo|confirmado|correto|corretos|certo|certa|está correto|esta correto|está certo|esta certo|pode registrar|pode gravar|aprovado|aprovada))?|está correto|esta correto|está certo|esta certo|tudo certo|pode registrar|pode gravar)[.!\s]*$/i.test(String(text || '').trim());
 }
 
-module.exports = {createConfirmations, parseCorrection, isApproval, fold};
+module.exports = {createConfirmations, parseCorrection, isApproval, fold, FIELD_KEYS};

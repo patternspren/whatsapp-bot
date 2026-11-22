@@ -4,16 +4,16 @@ Bot de WhatsApp que só inicia a análise quando alguém menciona o bot em um gr
 
 ## Funcionamento
 
-- Antes da menção, o bot mantém em memória uma janela das mensagens recentes para usar como contexto quando for chamado. Depois da menção, acompanha aquele grupo por até duas horas. As sessões são isoladas por grupo e equipamento.
-- O Gemini considera o texto, o título do grupo, a taxonomia, o glossário e as combinações de máquinas da planilha de configuração.
-- Anexos JPEG, PNG, WebP e PDF são enviados ao Gemini para leitura. Relatórios com vários equipamentos geram uma proposta para cada equipamento. Anexos acima de 20 MB ou em formatos não suportados ficam pendentes para revisão.
+- Antes da menção, o bot mantém em memória uma janela das mensagens recentes para usar como contexto quando for chamado. Depois da menção, acompanha aquele grupo por até duas horas. As sessões, filas de processamento e histórico de confirmações são isolados por grupo.
+- O Gemini considera o texto, o título do grupo, a taxonomia, o glossário e as combinações de máquinas da planilha de configuração (recarregadas periodicamente).
+- Anexos JPEG, PNG, WebP e PDF (inclusive quando enviados como `application/octet-stream` com extensão `.pdf`) são enviados ao Gemini para leitura. Relatórios com vários equipamentos geram uma proposta para cada equipamento. Anexos acima de 20 MB ou em formatos não suportados ficam pendentes para revisão.
 - PDFs com vários geradores recebem uma segunda leitura focada no GAP final de cada conjunto. Folga do virabrequim, pré-GAP e valores anteriores ao alinhamento não entram na coluna `Coupling GAP`.
-- A cada cinco minutos, o Gemini compara as mensagens e os anexos com os cabeçalhos reais da aba `Modelo alinhamento`. A conferência indica o destino, mostra os campos a gravar, identifica valores mantidos e apresenta o restante como `não informado`. Campos sem valor informado são gravados como `não informado` em linhas novas. Ao atualizar uma linha existente, os valores já conhecidos são preservados e os campos vazios recebem `não informado`.
+- A cada cinco minutos, o Gemini compara as mensagens e os anexos com os cabeçalhos reais da aba `Modelo alinhamento`. A conferência indica o destino, mostra os campos a gravar, identifica valores mantidos, sinaliza alterações com `(anterior: ...)` e apresenta o restante como `não informado`. Campos sem valor informado são gravados como `não informado` em linhas novas. Ao atualizar uma linha existente, os valores já conhecidos são preservados e os campos vazios recebem `não informado`.
 - Responda diretamente à mensagem de conferência com `confirmo` para aprovar todos os dados apresentados. Para corrigir ou completar campos, use o formato `Axial Vertical: -0,01 mm`. O bot apresenta a lista completa novamente e aguarda uma nova confirmação.
-- Se a pessoa confirmar os dados com uma divergência entre legenda e imagem ainda marcada, a célula recebe `usuário passou informação divergente` e a diferença fica nas observações.
+- Uma divergência entre legenda e imagem exige a escolha do valor correto e uma nova conferência. A confirmação e a correção ficam restritas à lista opcional `AUTHORIZED_APPROVERS` (quando configurada) ou à identidade que mencionou o bot, com verificação posterior da gravação na planilha.
 - Se embarcação ou equipamento ainda estiverem como `não informado`, o bot pede esses dados e não grava até poder identificar o registro com segurança.
 - O mesmo equipamento na mesma embarcação usa a linha existente, inclusive depois de duas horas. Se houver várias linhas históricas, a sessão ou uma data completa e única identifica a linha. Se o destino ficar ambíguo, ou mudar após a conferência, o bot pede nova validação antes de gravar.
-- Uma linha nova exige equipamento ainda não registrado na embarcação e confirmação explícita da proposta. Aguarde duas horas após a última inclusão identificável do bot para outro equipamento na mesma embarcação. Esse intervalo usa o horário guardado em `Comments` e não se aplica a linhas antigas sem esse horário.
+- Uma linha nova exige equipamento ainda não registrado na embarcação e confirmação explícita da proposta. Equipamentos diferentes podem ser registrados em sequência.
 - Tolerâncias e medições são extraídas separadamente. O código não calcula valores nem conclui aceitabilidade sem dados compatíveis.
 
 ## Planilhas e permissões
@@ -35,6 +35,9 @@ CONFIG_SPREADSHEET_ID=ID_DA_PLANILHA_DE_REFERENCIAS
 GEMINI_CONVERSATION_ENABLED=true
 GEMINI_API_KEY=CHAVE_FORNECIDA_PELO_AMBIENTE
 GEMINI_MODEL=gemini-3.1-flash-lite
+# Opcionais:
+# AUTHORIZED_APPROVERS=5521999990000,outro@s.whatsapp.net
+# ALLOWED_GROUP_JIDS=120363000000000000@g.us
 ```
 
 Execute `npm install` e depois `npm start`. O serviço de produção é gerenciado por systemd na VM `alinhamento-bot`.
@@ -45,4 +48,4 @@ IDs processados, sessões, propostas e pendências ficam em arquivos locais priv
 
 ## Verificação
 
-Rode `npm test` para verificar a confirmação completa, o destino da gravação, a ativação por menção e a espera de duas horas para incluir outro equipamento. Use um grupo de teste e dados fictícios para conferir a operação no WhatsApp e no Google Sheets.
+Rode `npm test` para verificar a confirmação completa, o destino da gravação, a ativação por menção e o registro sequencial de equipamentos. Use um grupo de teste e dados fictícios para conferir a operação no WhatsApp e no Google Sheets.

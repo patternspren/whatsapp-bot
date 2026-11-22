@@ -41,13 +41,31 @@ try {
   // Primeira execução: ainda não há IDs processados.
 }
 
+function hasSeen(groupJid, messageId) {
+  return Boolean(messageId) && (seenIds.has(`${groupJid}:${messageId}`) || seenIds.has(messageId));
+}
+
+function markSeen(groupJid, messageId) {
+  if (!messageId) return;
+  seenIds.add(groupJid ? `${groupJid}:${messageId}` : messageId);
+}
+
 function saveSeenIds() {
-  fs.writeFileSync(seenFile, JSON.stringify([...seenIds].slice(-10000), null, 2));
+  const payload = JSON.stringify([...seenIds].slice(-10000), null, 2);
+  if (typeof fs.renameSync === 'function') {
+    const tmp = seenFile + '.tmp';
+    fs.writeFileSync(tmp, payload, { mode: 0o600 });
+    fs.chmodSync?.(tmp, 0o600);
+    fs.renameSync(tmp, seenFile);
+    fs.chmodSync?.(seenFile, 0o600);
+    return;
+  }
+  fs.writeFileSync(seenFile, payload);
 }
 
 function appendPending(entry) {
   fs.appendFileSync(pendingFile, JSON.stringify(entry) + '\n', { mode: 0o600 });
-  fs.chmodSync(pendingFile, 0o600);
+  fs.chmodSync?.(pendingFile, 0o600);
 }
 
 function archiveFailedAttachment(groupJid, messageId, mimeType, data) {
@@ -56,21 +74,24 @@ function archiveFailedAttachment(groupJid, messageId, mimeType, data) {
   const extension = mimeType === 'application/pdf' ? '.pdf' : mimeType === 'image/png' ? '.png' :
     mimeType === 'image/webp' ? '.webp' : '.jpg';
   fs.mkdirSync(failedAttachmentsDir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(failedAttachmentsDir, 0o700);
+  fs.chmodSync?.(failedAttachmentsDir, 0o700);
   const file = path.join(failedAttachmentsDir, key + extension);
   fs.writeFileSync(file, data, { mode: 0o600 });
-  fs.chmodSync(file, 0o600);
+  fs.chmodSync?.(file, 0o600);
   return path.relative(__dirname, file);
 }
 
 function unwrapMessage(message) {
   let current = message;
   while (current?.ephemeralMessage?.message || current?.viewOnceMessage?.message ||
-         current?.viewOnceMessageV2?.message || current?.documentWithCaptionMessage?.message) {
+         current?.viewOnceMessageV2?.message || current?.viewOnceMessageV2Extension?.message ||
+         current?.documentWithCaptionMessage?.message || current?.editedMessage?.message) {
     current = current.ephemeralMessage?.message ||
       current.viewOnceMessage?.message ||
       current.viewOnceMessageV2?.message ||
-      current.documentWithCaptionMessage?.message;
+      current.viewOnceMessageV2Extension?.message ||
+      current.documentWithCaptionMessage?.message ||
+      current.editedMessage?.message;
   }
   return current || {};
 }
@@ -89,17 +110,45 @@ let alignmentTracker = null;
 let gemini = null;
 let activeSock = null;
 let alignmentConfigPromise = null;
+let alignmentConfigLoadedAt = 0;
+let getAlignmentConfig = async () => ({});
+const CONFIG_TTL_MS = 30 * 60 * 1000;
 const groupTitleCache = new Map();
 const {createConfirmations, parseCorrection, isApproval} = require('./confirmations');
 const history = require('./alignment_history');
 const confirmations = createConfirmations(path.join(__dirname, 'alignment-confirmations.json'));
-let confirmationQueue = Promise.resolve();
+const confirmationQueues = new Map();
+const groupMessageQueues = new Map();
+const foldText = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+const parseEnvList = value => String(value || '').split(/[,;]/).map(item => item.trim()).filter(Boolean);
+const authorizedApprovers = parseEnvList(process.env.AUTHORIZED_APPROVERS);
+const allowedGroupJids = new Set(parseEnvList(process.env.ALLOWED_GROUP_JIDS).map(item => item.toLowerCase()));
+const PROPOSAL_TTL_MS = 24 * 60 * 60 * 1000;
 
-function serializeConfirmations(operation) {
-  const result = confirmationQueue.then(operation);
-  confirmationQueue = result.catch(() => {});
+function enqueueByGroup(queueMap, group, operation) {
+  const key = group || '__default__';
+  const prev = queueMap.get(key) || Promise.resolve();
+  const result = prev.then(operation);
+  const settled = result.catch(() => {});
+  queueMap.set(key, settled);
+  settled.finally(() => {
+    if (queueMap.get(key) === settled) queueMap.delete(key);
+  });
   return result;
 }
+
+function serializeConfirmations(group, operation) {
+  if (typeof group === 'function') {
+    operation = group;
+    group = '__extract__';
+  }
+  return enqueueByGroup(confirmationQueues, group, operation);
+}
+
+function serializeGroup(group, operation) {
+  return enqueueByGroup(groupMessageQueues, group, operation);
+}
+
 const preMentionMessages = new Map();
 const armedGroups = new Map();
 const GROUP_ARM_WINDOW_MS = 2 * 60 * 60 * 1000;
@@ -110,7 +159,27 @@ function messageContextInfo(content) {
 }
 
 function jidDigits(value) {
-  return String(value || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+  const [user, domain] = String(value || '').toLowerCase().split('@');
+  return user && domain ? `${user.split(':')[0]}@${domain}` : '';
+}
+
+function approverMatches(candidate, allowed) {
+  if (!candidate || !allowed) return false;
+  if (allowed.includes('@')) return jidDigits(candidate) === jidDigits(allowed);
+  const allowedDigits = allowed.replace(/\D/g, '');
+  const [user, domain] = String(candidate).toLowerCase().split('@');
+  const candidateDigits = String(user || '').split(':')[0].replace(/\D/g, '');
+  return Boolean(allowedDigits) && domain !== 'lid' && candidateDigits === allowedDigits;
+}
+
+function isAuthorizedForConfirmation(msg, entry) {
+  const senders = [msg.key?.participant, msg.key?.participantAlt].filter(Boolean);
+  if (!senders.length) return false;
+  if (authorizedApprovers.length) {
+    return senders.some(sender => authorizedApprovers.some(allowed => approverMatches(sender, allowed)));
+  }
+  if (!entry.authorizedSender) return false;
+  return senders.some(sender => jidDigits(sender) === jidDigits(entry.authorizedSender));
 }
 
 function explicitlyMentionsBot(sock, content) {
@@ -139,7 +208,10 @@ async function publishReview(sock, group, sessionId, proposal) {
         ? [history.userComments(target?.current.comments), data.observations].filter(Boolean).join(' | ')
         : data[key];
       const previous = target?.current[key];
-      const shown = history.isKnown(value) ? value : history.isKnown(previous) ? `${previous} (mantido)` : 'não informado';
+      const changedExisting = key !== 'comments' && history.isKnown(value) && history.isKnown(previous) && foldText(value) !== foldText(previous);
+      const shown = history.isKnown(value)
+        ? (changedExisting ? `${value} (anterior: ${previous})` : value)
+        : history.isKnown(previous) ? `${previous} (mantido)` : 'não informado';
       return `${title}: ${shown}`;
     })
   );
@@ -156,8 +228,9 @@ async function publishReview(sock, group, sessionId, proposal) {
     'Confira todos os dados do alinhamento antes de gravar na planilha:',
     destination,
     ...displayLines,
+    proposal.attachmentPending ? 'A leitura do anexo falhou ou ficou incompleta; os dados da legenda precisam ser conferidos.' : '',
     ...conflicts.map(conflict => `Divergência ${conflict.field}: legenda ${conflict.caption || 'não informada'}; imagem ${conflict.visual || 'não legível'}.`),
-    conflicts.length ? 'Ao confirmar, os campos com divergência ainda marcada serão registrados como “usuário passou informação divergente”.' : '',
+    conflicts.length ? 'Escolha o valor correto de cada divergência informando o campo e o valor antes de confirmar.' : '',
     target ? 'Responda diretamente com “confirmo” para validar todos os dados acima.' : '',
     'Para corrigir ou completar algum dado, responda no formato “Campo: valor”. O bot enviará todos os dados para nova confirmação.'
   ].filter(Boolean).join('\n');
@@ -168,6 +241,7 @@ async function publishReview(sock, group, sessionId, proposal) {
     const sent = await sock.sendMessage(group, { text: prompt.text });
     if (!sent?.key?.id) throw new Error('Mensagem sem identificador');
     confirmations.sent(prompt.key, sent.key.id);
+    console.log('Conferência enviada:', group, sessionId, sent.key.id);
     return true;
   } catch {
     appendPending({groupJid:group, sessionId, reason:'proposta pendente: confirmação não enviada'});
@@ -179,29 +253,41 @@ if (geminiEnabled) {
   const { createTracker, fileStore, makeGeminiFunctions, verifyExtractions } = require('./gemini_conversation');
   const { loadAlignmentConfig } = require('./alignment_config');
   const store = fileStore(sessionsFile);
-  alignmentConfigPromise = loadAlignmentConfig(sheets, process.env.CONFIG_SPREADSHEET_ID);
+  getAlignmentConfig = () => {
+    if (!alignmentConfigPromise || Date.now() - alignmentConfigLoadedAt > CONFIG_TTL_MS) {
+      alignmentConfigLoadedAt = Date.now();
+      alignmentConfigPromise = loadAlignmentConfig(sheets, process.env.CONFIG_SPREADSHEET_ID).catch(error => {
+        alignmentConfigPromise = null;
+        throw error;
+      });
+    }
+    return alignmentConfigPromise;
+  };
+  alignmentConfigPromise = getAlignmentConfig();
   gemini = makeGeminiFunctions({
     apiKey: process.env.GEMINI_API_KEY,
     model: process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite',
-    config: alignmentConfigPromise,
+    config: getAlignmentConfig,
     getRecordSchema: () => history.getRecordSchema(sheets, spreadsheetId),
-    onExtract: (session, reason, extraction, transcript) => serializeConfirmations(async () => {
+    onExtract: (session, reason, extraction, transcript) => serializeConfirmations(session.group, async () => {
       const checkedRecords = verifyExtractions(extraction, transcript);
       const proposed = new Set();
       let pending = 0;
       let deliveryFailed = false;
       const sourceVersion = crypto.createHash('sha256')
         .update(JSON.stringify(session.messages.map(({id, text}) => [id, text]))).digest('hex');
-      const fieldKeys = {
+      const fieldKeys = Object.fromEntries(Object.entries({
         'Equipment Class':'class', Maker:'maker', Model:'model',
         'Stationary Equipment Class':'stationary_class', 'Stationary Maker':'stationary_maker',
-        'Stationary Model':'stationary_model', Document:'document', Data:'date',
-        Motivacao:'motivation', Motivation:'motivation', Executor:'executor', Metodo:'method', Method:'method',
+        'Stationary Model':'stationary_model', Document:'document', Data:'date', Date:'date',
+        Motivacao:'motivation', Motivation:'motivation', Motivo:'motivation',
+        Executor:'executor', Responsavel:'executor', Metodo:'method', Method:'method',
         'Axial vertical':'axial_vertical', 'Axial horizontal':'axial_horizontal',
         'Radial vertical':'radial_vertical', 'Radial horizontal':'radial_horizontal',
-        'Coupling gap':'coupling_gap', 'Padrão':'standard', 'Axial tolerance':'axial_tolerance',
-        'Radial tolerance':'radial_tolerance', 'Coupling gap tolerance':'gap_tolerance'
-      };
+        'Coupling gap':'coupling_gap', 'Padrão':'standard', Standard:'standard',
+        'Axial tolerance':'axial_tolerance', 'Radial tolerance':'radial_tolerance',
+        'Coupling gap tolerance':'gap_tolerance'
+      }).map(([label, key]) => [foldText(label), key]));
       for (const checked of checkedRecords) {
         if (!checked.ok) {
           pending += 1;
@@ -245,15 +331,17 @@ if (geminiEnabled) {
           try {
             const conflict = JSON.parse(line.slice('DIVERGENCIA_MEDICAO: '.length));
             if ((history.equipmentIdentity(currentEquipment) === equipmentKey || checkedRecords.length === 1) &&
-                !conflicts.some(item => item.field === conflict.field)) conflicts.push(conflict);
+                !conflicts.some(item => foldText(item.field) === foldText(conflict.field))) conflicts.push(conflict);
           } catch {}
         }
         for (const conflict of conflicts) {
-          const key = fieldKeys[conflict.field] || fieldKeys[conflict.field[0]?.toUpperCase() + conflict.field.slice(1)];
+          const key = fieldKeys[foldText(conflict.field)];
           if (key) data[key] = 'usuário passou informação divergente';
         }
         const sent = await publishReview(activeSock, session.group, sessionId, {
-          data, conflicts, sourceVersion, startedAt:session.startedAt
+          data, conflicts, sourceVersion, startedAt:session.startedAt,
+          attachmentPending: session.messages.some(m => /\[Leitura do anexo indisponível/.test(m.text)),
+          authorizedSender: session.authorizedSender || session.messages.find(m => m.explicitMention && m.senderJid)?.senderJid || ''
         });
         if (!sent) deliveryFailed = true;
       }
@@ -270,7 +358,7 @@ if (geminiEnabled) {
       try {
         return await gemini.classify(previous, current);
       } catch (error) {
-    console.error('Falha de classificação Gemini; mantendo mensagem pendente.');
+        console.error('Falha de classificação Gemini; mantendo mensagem pendente.');
         return 'uncertain';
       }
     },
@@ -287,7 +375,16 @@ if (geminiEnabled) {
     finish: async (session, reason) => {
       if (!session.activatedByMention) return;
       try {
-        await gemini.finish(session, reason);
+        const result = await gemini.finish(session, reason);
+        if (result?.deliveryFailed) {
+          appendPending({
+            groupJid: session.group,
+            startedAt: session.startedAt,
+            closedAt: new Date().toISOString(),
+            reason: 'falha ao entregar proposta ao fechar sessão',
+            messages: session.messages
+          });
+        }
       } catch (error) {
         appendPending({
           groupJid: session.group,
@@ -312,7 +409,6 @@ if (geminiEnabled) {
   }, 5 * 60 * 1000).unref();
 }
 
-
 async function handleConfirmation(sock, msg, text, quotedId) {
   const groupJid = msg.key.remoteJid;
   const messageId = msg.key.id;
@@ -323,23 +419,42 @@ async function handleConfirmation(sock, msg, text, quotedId) {
   const reply = async text => {
     try { await sock.sendMessage(groupJid, { text, quoted: msg }); } catch {}
   };
+  if (!isAuthorizedForConfirmation(msg, entry)) {
+    await reply(authorizedApprovers.length
+      ? 'Somente uma pessoa autorizada pode responder a esta conferência.'
+      : 'Somente a pessoa que solicitou esta conferência pode respondê-la. Se necessário, marque o bot para iniciar outra solicitação.');
+    return true;
+  }
   if (entry.status === 'superseded') {
     await reply('Responda à última mensagem de conferência do bot. Esta versão foi substituída.');
+    return true;
+  }
+  if (entry.status === 'answered') {
+    await reply('Esta conferência já foi validada e gravada na planilha. Marque o bot novamente para iniciar uma nova conferência.');
+    return true;
+  }
+  if (entry.createdAt && Date.now() - entry.createdAt > PROPOSAL_TTL_MS) {
+    await reply('Esta proposta de conferência expirou. Marque o bot novamente para gerar uma nova conferência.');
     return true;
   }
 
   const corrections = parseCorrection(text, entry.conflicts || []);
   const approved = isApproval(text);
-  if (entry.status === 'answered' && !corrections.length) return true;
   if (!corrections.length && !approved) {
-    await reply('Responda “confirmo” para validar todos os dados ou indique as correções no formato “Campo: valor”.');
+    if (/\b(?:axial|radial)\s+(?:vertical|horizontal)\s*[:=]?\s*[+-]?\d/i.test(text)) {
+      await reply('Informe a unidade da medição (ex.: “Axial Vertical: -0,01 mm”).');
+    } else {
+      await reply('Responda “confirmo” para validar todos os dados ou indique as correções no formato “Campo: valor”.');
+    }
     return true;
   }
 
   const data = { ...entry.data };
   const sessionId = entry.sessionId;
+  const approverId = [msg.key.participant, msg.key.participantAlt].map(jidDigits).find(Boolean) || '';
   const makeReview = (conflicts = entry.conflicts || []) => publishReview(sock, groupJid, sessionId, {
     data, conflicts, sourceVersion: entry.sourceVersion, startedAt: entry.startedAt, parentKey: key,
+    authorizedSender: entry.authorizedSender, attachmentPending: entry.attachmentPending,
     requireExisting: Boolean(entry.target?.row || entry.requireExisting) && history.sameEquipment(data, entry.data)
   });
   if (!sessionId) {
@@ -360,13 +475,17 @@ async function handleConfirmation(sock, msg, text, quotedId) {
         !corrections.some(change => change.key === parseCorrection(`${conflict.field}: 0 mm`)[0]?.key)
       );
       if (await makeReview(conflicts)) {
-        if (messageId) { seenIds.add(messageId); saveSeenIds(); }
+        if (messageId) { markSeen(groupJid, messageId); saveSeenIds(); }
       } else {
         await reply('Não consegui enviar a proposta corrigida. Responda novamente com as correções para tentar de novo.');
       }
       return true;
     }
 
+    if ((entry.conflicts || []).length) {
+      await reply('Ainda há divergências. Informe o campo e o valor escolhido para receber uma nova conferência.');
+      return true;
+    }
     if (!entry.target) {
       if (entry.target === null) {
         await reply('Ainda preciso identificar o destino. Confira os dados solicitados na mensagem de conferência.');
@@ -382,7 +501,8 @@ async function handleConfirmation(sock, msg, text, quotedId) {
     const result = await history.recordHistory(sheets, spreadsheetId, {
       ...data,
       observations: [data.observations, conflictNotes].filter(Boolean).join('; '),
-      groupJid
+      groupJid,
+      approvedBy: approverId
     }, sessionId, { target: entry.target, confirmationId: key });
     if (!['appended', 'updated', 'unchanged'].includes(result.status)) {
       appendPending({ groupJid, messageId, sessionId, reason: result.status });
@@ -390,8 +510,9 @@ async function handleConfirmation(sock, msg, text, quotedId) {
       if (!await makeReview()) await reply('Não consegui enviar a nova conferência. Tente confirmar novamente.');
       return true;
     }
-    confirmations.done(key, messageId);
-    if (messageId) { seenIds.add(messageId); saveSeenIds(); }
+    confirmations.done(key, messageId, 'answered', approverId);
+    console.log('Gravação verificada:', groupJid, sessionId, result.row || 'linha desconhecida');
+    if (messageId) { markSeen(groupJid, messageId); saveSeenIds(); }
     await reply(result.row ? `Dados validados e gravados na linha ${result.row} da planilha.`
       : 'Dados validados e gravados na planilha.');
   } catch (error) {
@@ -402,9 +523,10 @@ async function handleConfirmation(sock, msg, text, quotedId) {
   return true;
 }
 
-async function handleMessage(sock, msg, options = {}) {
+async function handleMessageInternal(sock, msg, options = {}) {
   const groupJid = msg.key.remoteJid || '';
   if (!groupJid.endsWith('@g.us') || msg.key.fromMe) return;
+  if (allowedGroupJids.size && !allowedGroupJids.has(groupJid.toLowerCase())) return;
 
   let text = getMessageText(msg.message).trim();
   const content = unwrapMessage(msg.message);
@@ -414,12 +536,12 @@ async function handleMessage(sock, msg, options = {}) {
   if (!text && !attachment) return;
 
   const messageId = msg.key.id;
-  if (messageId && seenIds.has(messageId)) return;
+  if (hasSeen(groupJid, messageId)) return;
 
   if (geminiEnabled) {
     const contextInfo = messageContextInfo(content);
 
-    if (contextInfo.stanzaId && await serializeConfirmations(() =>
+    if (contextInfo.stanzaId && await serializeConfirmations(groupJid, () =>
       handleConfirmation(sock, msg, text, contextInfo.stanzaId))) return;
 
     const mentioned = explicitlyMentionsBot(sock, content);
@@ -434,8 +556,8 @@ async function handleMessage(sock, msg, options = {}) {
       preMentionMessages.delete(groupJid);
       armedGroups.set(groupJid, Date.now() + GROUP_ARM_WINDOW_MS);
       if (activeSession && !activeSession.activatedByMention) await alignmentTracker.clearGroup?.(groupJid);
-      for (const item of buffered) await handleMessage(sock, item.msg, {replay:true, activated:true});
-      return handleMessage(sock, msg, {replay:true, activated:true});
+      for (const item of buffered) await handleMessageInternal(sock, item.msg, {replay:true, activated:true});
+      return handleMessageInternal(sock, msg, {replay:true, activated:true, explicitMention:true});
     }
     if (active || options.activated) armedGroups.set(groupJid, Date.now() + GROUP_ARM_WINDOW_MS);
 
@@ -443,8 +565,9 @@ async function handleMessage(sock, msg, options = {}) {
       console.log('Mensagem sobre relatório sem anexo reconhecido:', groupJid, messageId);
     }
 
-    let groupName = groupTitleCache.get(groupJid)?.name || '';
-    if (!groupName || Date.now() - groupTitleCache.get(groupJid).time > 60 * 60 * 1000) {
+    const cachedGroup = groupTitleCache.get(groupJid);
+    let groupName = cachedGroup?.name || '';
+    if (!groupName || Date.now() - cachedGroup.time > 60 * 60 * 1000) {
       try {
         groupName = (await sock.groupMetadata(groupJid)).subject || '';
         groupTitleCache.set(groupJid, { name: groupName, time: Date.now() });
@@ -453,35 +576,48 @@ async function handleMessage(sock, msg, options = {}) {
     if (attachment) {
       const mimeType = image?.mimetype || document?.mimetype || '';
       const fileName = document?.fileName || '';
-      console.log('Anexo recebido:', groupJid, messageId, mimeType, fileName);
-      if (!/^image\/(jpeg|png|webp)$|^application\/pdf$/i.test(mimeType)) {
-        appendPending({ messageId, groupJid, groupName, fileName, mimeType, reason: 'formato de anexo não suportado' });
-        text += `\n[Anexo ${fileName || mimeType || 'não identificado'}: formato não suportado para leitura]`;
+      const isOctetPdf = /^application\/octet-stream$/i.test(mimeType) && /\.pdf$/i.test(fileName);
+      const effectiveMimeType = isOctetPdf ? 'application/pdf' : mimeType;
+      appendPending({stage:'recebida', messageId, groupJid, senderJid:msg.key.participant || '',
+        timestamp:msg.messageTimestamp ? String(msg.messageTimestamp) : '', caption:text, mimeType:effectiveMimeType, fileName});
+      console.log('Anexo recebido:', groupJid, messageId, effectiveMimeType, fileName);
+      if (!/^image\/(jpeg|png|webp)$|^application\/pdf$/i.test(effectiveMimeType)) {
+        appendPending({ messageId, groupJid, groupName, fileName, mimeType:effectiveMimeType, reason: 'formato de anexo não suportado' });
+        text += `\n[Leitura do anexo indisponível: formato ${fileName || mimeType || 'não identificado'} não suportado.]`;
       } else {
         let data;
         try {
-          data = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) });
+          data = await downloadMediaMessage(
+            msg,
+            'buffer',
+            {},
+            {
+              logger: P({ level: 'silent' }),
+              ...(sock?.updateMediaMessage ? { reuploadRequest: sock.updateMediaMessage } : {})
+            }
+          );
           if (data.length > 20 * 1024 * 1024) throw new Error('Anexo excede 20 MB');
-          const summary = await gemini.inspectAttachment({ caption: text, groupName, fileName, mimeType, data });
-          if (image && /\b(?:axial|radial)\s+(?:vertical|horizontal)\s*:\s*[+-]?\d/i.test(text)) {
+          const summary = await gemini.inspectAttachment({ caption: text, groupName, fileName, mimeType: effectiveMimeType, data });
+          if (summary && image && /\b(?:axial|radial)\s+(?:vertical|horizontal)\s*:\s*[+-]?\d/i.test(text)) {
             const originalCaption = text;
             const labels = [...originalCaption.matchAll(/\b(axial|radial)\s+(vertical|horizontal)\s*:\s*([+-]?\d+(?:[.,]\d+)?)/gi)];
             const safeSummary = String(summary || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
             for (const item of labels) {
               const field = (item[1] + ' ' + item[2]).toLowerCase();
               const value = item[3];
-              if (!safeSummary.includes(field + ': ' + value.toLowerCase() + ' mm')) {
+              if (!safeSummary.includes(field + ': ' + value.toLowerCase())) {
                 appendPending({ messageId, groupJid, groupName, reason: 'medição da legenda sem confirmação visual', field, value });
               }
             }
-            text = text.replace(/\b(axial|radial)\s+(vertical|horizontal)\s*:\s*[+-]?\d+(?:[.,]\d+)?(?:\s*mm)?/gi,
+            text = text.replace(/\b(axial|radial)\s+(vertical|horizontal)\s*:\s*[+-]?\d+(?:[.,]\d+)?(?:\s*(?:mm|cm|µm|μm|um|mils?|in|pol))?/gi,
               '$1 $2: verificação visual no resumo do anexo');
           }
           if (!summary) {
-            const savedAs = archiveFailedAttachment(groupJid, messageId, mimeType, data);
-            appendPending({ messageId, groupJid, groupName, fileName, mimeType, savedAs,
+            const savedAs = archiveFailedAttachment(groupJid, messageId, effectiveMimeType, data);
+            appendPending({ messageId, groupJid, groupName, fileName, mimeType:effectiveMimeType, savedAs,
               reason: 'Gemini retornou resumo vazio para o anexo' });
-            console.error('Anexo sem dados extraídos:', groupJid, messageId, mimeType);
+            console.error('Anexo sem dados extraídos:', groupJid, messageId, effectiveMimeType);
+            text += '\n[Leitura do anexo indisponível; confira os valores informados na legenda.]';
             if (!text) return;
           } else {
             console.log('Anexo interpretado:', groupJid, messageId, summary.length);
@@ -489,12 +625,15 @@ async function handleMessage(sock, msg, options = {}) {
           }
         } catch (error) {
           let savedAs = null;
-          try { if (data?.length <= 20 * 1024 * 1024) savedAs = archiveFailedAttachment(groupJid, messageId, mimeType, data); }
+          try { if (data?.length <= 20 * 1024 * 1024) savedAs = archiveFailedAttachment(groupJid, messageId, effectiveMimeType, data); }
           catch (archiveError) { console.error('Falha ao preservar anexo:', archiveError.message); }
-          appendPending({ messageId, groupJid, groupName, fileName, mimeType, savedAs,
+          appendPending({ messageId, groupJid, groupName, fileName, mimeType:effectiveMimeType, savedAs,
             reason: `não foi possível ler o anexo: ${error.message}` });
           console.error('Não foi possível ler um anexo da conversa:', error.message);
-          return;
+          text += '\n[Leitura do anexo indisponível; confira os valores informados na legenda.]';
+          if (typeof sock?.sendMessage === 'function') {
+            try { await sock.sendMessage(groupJid, { text: 'Não consegui ler o anexo enviado; registrei para revisão e vou usar o que estiver informado no texto.', quoted: msg }); } catch {}
+          }
         }
       }
     }
@@ -507,12 +646,15 @@ async function handleMessage(sock, msg, options = {}) {
       id: messageId || '',
       timestamp,
       sender: msg.pushName || '',
+      senderJid: msg.key.participant || msg.key.participantAlt || '',
+      explicitMention: options.explicitMention === true,
+      originalText: getMessageText(msg.message),
       groupName,
       activatedByMention: options.activated === true || active,
       text: groupName ? `[Grupo: ${groupName}]\n${text}` : text
     });
     if (outcome !== 'ignorada' && messageId) {
-      seenIds.add(messageId);
+      markSeen(groupJid, messageId);
       saveSeenIds();
     }
     if (outcome !== 'ignorada') console.log('Coleta de alinhamento:', outcome, groupJid);
@@ -525,9 +667,22 @@ async function handleMessage(sock, msg, options = {}) {
   }
 }
 
+async function handleMessage(sock, msg, options = {}) {
+  const groupJid = msg?.key?.remoteJid || '';
+  if (!groupJid.endsWith('@g.us') || msg.key.fromMe) return;
+  if (allowedGroupJids.size && !allowedGroupJids.has(groupJid.toLowerCase())) return;
+  if (options.replay) return handleMessageInternal(sock, msg, options);
+  return serializeGroup(groupJid, () => handleMessageInternal(sock, msg, options));
+}
+
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+let shuttingDown = false;
+
 async function startBot() {
-  if (geminiEnabled) await alignmentConfigPromise;
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_info_baileys');
+  if (shuttingDown) return;
+  if (geminiEnabled) await getAlignmentConfig();
+  const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, 'auth_info_baileys'));
   const sock = makeWASocket({
     auth: state,
     logger: P({ level: 'silent' }),
@@ -542,20 +697,40 @@ async function startBot() {
       console.log('Escaneie o QR Code com o WhatsApp que ficará conectado ao grupo:');
       qrcode.generate(qr, { small: true });
     }
-    if (connection === 'open') console.log(geminiEnabled
-      ? 'Coletor conectado; aguardando menção explícita em um grupo.'
-      : 'Coletor conectado em modo silencioso.');
+    if (connection === 'open') {
+      reconnectAttempt = 0;
+      console.log(geminiEnabled
+        ? 'Coletor conectado; aguardando menção explícita em um grupo.'
+        : 'Coletor conectado em modo silencioso.');
+    }
     if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      if (shouldReconnect) setTimeout(startBot, 3000);
-      else console.error('Sessão desconectada. Reinicie e escaneie um novo QR Code.');
+      if (activeSock === sock) activeSock = null;
+      try { sock.ev.removeAllListeners?.(); } catch {}
+      const shouldReconnect = !shuttingDown && lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      if (shouldReconnect) {
+        if (!reconnectTimer) {
+          const delay = Math.min(3000 * Math.pow(2, reconnectAttempt), 30000);
+          reconnectAttempt += 1;
+          reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            startBot().catch(error => console.error('Falha ao reconectar ao WhatsApp:', error.message));
+          }, delay);
+        }
+      } else if (!shuttingDown) {
+        console.error('Sessão desconectada. Reinicie e escaneie um novo QR Code.');
+      }
     }
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+    if (type !== 'notify' && type !== 'append') return;
+    const now = Date.now();
     for (const msg of messages) {
       if (!msg.message) continue;
+      if (type === 'append') {
+        const tsMs = Number(msg.messageTimestamp) * 1000;
+        if (!Number.isFinite(tsMs) || now - tsMs > GROUP_ARM_WINDOW_MS) continue;
+      }
       try {
         await handleMessage(sock, msg);
       } catch (error) {
@@ -575,7 +750,7 @@ async function recoverAttachment(savedAs) {
   const entry = entries.find(item => item.savedAs === path.relative(__dirname, resolved) && item.groupJid && item.mimeType);
   if (!entry) throw new Error('Anexo não encontrado no registro de pendências.');
   const data = fs.readFileSync(resolved);
-  await alignmentConfigPromise;
+  await getAlignmentConfig();
   const summary = await gemini.inspectAttachment({
     caption:'', groupName:entry.groupName, fileName:entry.fileName, mimeType:entry.mimeType, data
   });
@@ -596,14 +771,30 @@ async function recoverAttachment(savedAs) {
   delete session.lastAnalyzedMessageCount;
   sessions[entry.groupJid] = session;
   store.save(sessions);
-  if (entry.messageId) { seenIds.add(entry.messageId); saveSeenIds(); }
+  if (entry.messageId) { markSeen(entry.groupJid, entry.messageId); saveSeenIds(); }
   appendPending({messageId:entry.messageId, savedAs:entry.savedAs,
     recoveredAt:new Date().toISOString(), reason:'anexo recuperado para conferência no WhatsApp'});
   console.log('Anexo recuperado. A instância do bot deve carregar a sessão para enviar a conferência.');
 }
 
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  const pending = [
+    ...Array.from(groupMessageQueues.values()),
+    ...Array.from(confirmationQueues.values())
+  ];
+  await Promise.race([
+    Promise.allSettled(pending),
+    new Promise(resolve => setTimeout(resolve, 10000).unref())
+  ]);
+  try { activeSock?.end?.(new Error(signal)); } catch {}
+  process.exit(0);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 console.log('Iniciando coletor silencioso de mensagens de alinhamento...');
 const operation = process.argv[2] === '--recover-attachment'
@@ -612,5 +803,3 @@ operation.catch((error) => {
   console.error('Não foi possível iniciar o coletor:', error.message);
   process.exit(1);
 });
-
-

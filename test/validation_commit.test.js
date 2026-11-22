@@ -47,18 +47,16 @@ function harness(entry, writeResult = {status:'updated',row:3}) {
   return {handle:context.handle,writes,completed,replies,sock:{sendMessage:async(_group,message)=>{replies.push(message);return {key:{id:'bot-reply'}};}}};
 }
 
-const proposal=()=>({status:'sent',sessionId:'same-session',target:{row:3,revision:'initial'},startedAt:'2026-11-18T10:00:00.000Z',data:{
+const proposal=()=>({status:'sent',authorizedSender:'isabela@s.whatsapp.net',sessionId:'same-session',target:{row:3,revision:'initial'},startedAt:'2026-11-18T10:00:00.000Z',data:{
   vessel:'BRAM Atlas',equipment:'MCP 1',axial_vertical:'usuário passou informação divergente'
 },conflicts:[{field:'Axial Vertical',caption:'-0.015 mm',visual:'-0.01 mm'}]});
-const reply=(text,stanzaId='proposal',id='response')=>({key:{remoteJid:'grupo@g.us',id},message:{extendedTextMessage:{text,contextInfo:{stanzaId}}}});
+const reply=(text,stanzaId='proposal',id='response')=>({key:{remoteJid:'grupo@g.us',participant:'isabela@s.whatsapp.net',id},message:{extendedTextMessage:{text,contextInfo:{stanzaId}}}});
 
-test('só grava após a resposta e marca a célula de divergência confirmada',async()=>{
+test('divergência exige escolha explícita antes de gravar',async()=>{
   const h=harness(proposal());
   await h.handle(h.sock,reply('confirmo'));
-  assert.equal(h.writes.length,1);
-  assert.equal(h.writes[0].data.axial_vertical,'usuário passou informação divergente');
-  assert.equal(h.completed[0].key,'proposal-key');
-  assert.equal(h.writes[0].options.target.row,3);
+  assert.equal(h.writes.length,0);
+  assert.match(h.replies[0].text,/divergências/);
   assert.equal(h.replies.length,1);
 });
 
@@ -78,9 +76,17 @@ test('correção pede nova validação completa e só depois grava na mesma linh
 });
 
 test('destino alterado exige nova conferência e não confirma gravação',async()=>{
-  const h=harness(proposal(), {status:'target_changed'});
+  const h=harness({...proposal(),conflicts:[]}, {status:'target_changed'});
   await h.handle(h.sock,reply('confirmo'));
   assert.equal(h.completed.length,0);
   assert.match(h.replies[0].text,/planilha mudou/);
   assert.match(h.replies[1].text,/linha 3 já existente/);
+});
+
+test('outra pessoa não pode confirmar a proposta',async()=>{
+  const h=harness({...proposal(),conflicts:[]});
+  const msg=reply('confirmo'); msg.key.participant='outra@s.whatsapp.net';
+  await h.handle(h.sock,msg);
+  assert.equal(h.writes.length,0);
+  assert.match(h.replies[0].text,/Somente a pessoa/);
 });

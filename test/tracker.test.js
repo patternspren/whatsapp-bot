@@ -40,4 +40,15 @@ test('sincroniza novamente quando chegam dados novos e retenta falhas transitór
   assert.equal(calls, 3);
 });
 
+test('menção explícita abre sessão mesmo se detector rejeitar e sobrevive à retomada', async () => {
+  let state = {};
+  const create = () => createTracker({detect:async()=>false, classify:async()=> 'unrelated', finish:async()=>{},
+    save:async value=>{state=JSON.parse(JSON.stringify(value));},load:()=>state});
+  let tracker=create();
+  assert.equal(await tracker.process({group:'g',id:'m',text:'Axial vertical: -0.015',explicitMention:true,activatedByMention:true,senderJid:'isabela@lid'}),'aberta');
+  tracker=create();
+  assert.equal(tracker.snapshot().g.messages[0].senderJid,'isabela@lid');
+  assert.equal(await tracker.process({group:'g',id:'m',text:'Axial vertical: -0.015'}),'duplicada');
+});
+
 
