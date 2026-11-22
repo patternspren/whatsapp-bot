@@ -41,6 +41,14 @@ Sempre confira o comportamento real no código e nos testes antes de assumir qua
 - **Próximo passo sugerido**: <ação exata recomendada para o próximo agente/ferramenta>
 ```
 
+### Papéis especializados do projeto (Antigravity e Codex)
+
+No Google Antigravity, os arquivos em `.agents/agents/` funcionam como Custom Agents nativos. No **Codex** (ou em qualquer outro assistente que leia este repositório), quando o usuário mencionar um dos papéis abaixo pelo nome, leia o arquivo Markdown correspondente e siga seu escopo, checklist e limites (usando as ferramentas disponíveis no ambiente atual):
+
+- **`diagnosticador`** -> `.agents/agents/diagnosticador.md` (investigação de causa raiz em modo somente leitura, sem editar arquivos).
+- **`integracoes`** -> `.agents/agents/integracoes.md` (desenvolvimento Node.js e integrações Baileys, Gemini, Google Sheets e GCP; propor e aguardar aprovação explícita antes de alterar código).
+- **`qa-testes`** -> `.agents/agents/qa-testes.md` (simulações quase reais ponta a ponta em `test/`, auditoria célula a célula na aba `Modelo alinhamento` e evidências com `node --test`).
+
 ## 5. Validação Padrão Offline
 
 - Execute `npm test` (ou `node --test`).
