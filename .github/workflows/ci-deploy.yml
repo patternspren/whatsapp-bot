@@ -81,6 +81,6 @@ jobs:
             --zone="${GCE_ZONE}" \
             --tunnel-through-iap \
             --quiet \
-            --command="bash -s -- '${GITHUB_SHA}'" \
+            --command="sudo -n -u matheus_cordeirorf bash -s -- '${GITHUB_SHA}'" \
             < scripts/deploy-vm.sh
 
