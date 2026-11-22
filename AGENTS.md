@@ -4,7 +4,8 @@ Este arquivo orienta **Google Antigravity**, **OpenAI Codex** e colaboradores qu
 
 ## 1. Sobre o Projeto
 
-- **Objetivo**: bot de WhatsApp que aguarda menção explícita em um grupo, reúne o contexto recente, interpreta mensagens e anexos (imagens/PDFs) usando a Gemini API, publica uma mensagem de conferência no grupo e, somente após aprovação explícita (`confirmo` / `confirmado`) por participante autorizado (`AUTHORIZED_APPROVERS` ou solicitante original), grava ou atualiza registros na aba `Modelo alinhamento` do Google Sheets com verificação pós-gravação.
+- **Objetivo**: bot de WhatsApp que aguarda menção explícita em um grupo, reúne o contexto recente, interpreta mensagens e anexos (imagens/PDFs) usando a Gemini API, **grava imediatamente** os campos válidos recebidos na aba `Modelo alinhamento` do Google Sheets (com verificação pós-gravação) e solicita os campos obrigatórios ainda faltantes de forma incremental na mesma linha (com ou sem citação quando houver 1 alinhamento em aberto).
+- **Autorização padrão**: qualquer participante do grupo pode completar ou corrigir campos, salvo quando `AUTHORIZED_APPROVERS` ou `RESTRICT_CONFIRMATION_TO_REQUESTER=true` estiverem configurados.
 - **Execução em produção**: VM Compute Engine `alinhamento-bot` (Debian 13, Node.js, serviço systemd `alinhamento-bot.service`), usando Application Default Credentials (ADC) e deploy automatizado via GitHub Actions após aprovação no ambiente `production`.
 
 ## 2. Fontes de Verdade vs Documentação Legada

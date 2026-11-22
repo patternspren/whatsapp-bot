@@ -1,5 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -56,7 +57,7 @@ function createRealisticModelSheet(initialDataRows = []) {
   };
 
   const configTabs = {
-    Taxonomia: [['Taxonomia'], ['Motor Diesel'], ['Propulsão'], ['Gerador']],
+    Taxonomia: [['Taxonomia'], ['Motor Diesel'], ['Propulsor'], ['Gerador']],
     Glossario: [['Termo', 'Significado'], ['MCP', 'Motor de Combustão Principal'], ['DG', 'Diesel Generator'], ['Bordo', 'Lado da embarcação']],
     'Configurações': [['Maquina a ser alinhada / Drive Machine'], ['Motor Diesel / Gerador']],
     masterlist: [['', 'Navio'], ['Nome', 'Operação'], ['BRAM Atlas', 'PSV'], ['BRAM Breeze', 'PSV']]
@@ -64,6 +65,7 @@ function createRealisticModelSheet(initialDataRows = []) {
 
   const state = {
     failNextAppend: null,
+    failNextBatchUpdate: null,
     corruptNextAppend: false,
     writes: []
   };
@@ -121,6 +123,11 @@ function createRealisticModelSheet(initialDataRows = []) {
         },
         batchUpdate: async ({ requestBody }) => {
           assert.equal(requestBody.valueInputOption, 'RAW');
+          if (state.failNextBatchUpdate) {
+            const err = state.failNextBatchUpdate;
+            state.failNextBatchUpdate = null;
+            throw err;
+          }
           state.writes.push({ type: 'batchUpdate', count: requestBody.data.length });
           for (const item of requestBody.data) {
             const match = item.range.match(/!([A-Z]+)(\d+)$/);
@@ -263,14 +270,13 @@ const geminiJsonResponse = (obj) => ({
   })
 });
 
-test('QA realista 1: fluxo completo em 24 colunas com correção "Campo: valor", títulos repetidos, "confirmado" por participante e auditoria célula a célula', async () => {
+test('QA realista 1: fluxo completo em 24 colunas com gravação imediata, atualização sem/com citação, títulos repetidos, encerramento e auditoria célula a célula', async () => {
   const group = 'grupo-atlas@g.us';
   const requester = '5521911112222@s.whatsapp.net';
   const isabela = '5521988887777@s.whatsapp.net';
   const model = createRealisticModelSheet();
 
   const bot = bootRealisticBot({
-    env: { AUTHORIZED_APPROVERS: '5521988887777' },
     sheetModel: model,
     fetchHandler: async (_url, options) => {
       const prompt = JSON.parse(options.body).contents[0].parts[0].text;
@@ -280,7 +286,7 @@ test('QA realista 1: fluxo completo em 24 colunas com correção "Campo: valor",
       if (prompt.includes('Extraia um registro')) {
         return geminiJsonResponse({
           records: [{
-            status: 'ready',
+            status: 'incomplete',
             vessel: { value: 'BRAM Atlas', message: 1, quote: 'BRAM Atlas' },
             equipment: { value: 'MCP 1', message: 1, quote: 'MCP 1' },
             fields: {
@@ -290,9 +296,7 @@ test('QA realista 1: fluxo completo em 24 colunas com correção "Campo: valor",
               stationary_maker: { value: 'Rolls-Royce', message: 1, quote: 'Rolls-Royce' },
               date: { value: '22/11/2026', message: 1, quote: '22/11/2026' },
               method: { value: 'Laser', message: 1, quote: 'Laser' },
-              axial_vertical: { value: '-0,05 mm', message: 1, quote: '-0,05 mm' },
-              radial_horizontal: { value: '+0.02 mm', message: 1, quote: '+0.02 mm' },
-              coupling_gap: { value: '28,00 mm', message: 1, quote: '28,00 mm' }
+              axial_vertical: { value: '-0,05 mm', message: 1, quote: '-0,05 mm' }
             }
           }]
         });
@@ -308,78 +312,68 @@ test('QA realista 1: fluxo completo em 24 colunas com correção "Campo: valor",
       messageTimestamp: ts,
       message: {
         extendedTextMessage: {
-          text: '@bot BRAM Atlas MCP 1 Motor Diesel Wartsila Propulsor Rolls-Royce 22/11/2026 Laser axial vertical -0,05 mm radial horizontal +0.02 mm coupling gap 28,00 mm',
+          text: '@bot BRAM Atlas MCP 1 Motor Diesel Wartsila Propulsor Rolls-Royce 22/11/2026 Laser Axial Vertical: -0,05 mm',
           contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] }
         }
       }
     });
 
-    await bot.tick();
+    // Gravação imediata parcial na linha 3 + cobrança dos 6 obrigatórios faltantes
+    assert.equal(model.rows.length, 3);
     assert.equal(bot.sentMessages.length, 1);
-    const firstProposal = bot.sentMessages[0];
-    assert.match(firstProposal.text, /Destino: nova linha para este equipamento\./);
-    assert.match(firstProposal.text, /Maker \(Drive Machine\): Wartsila/);
-    assert.match(firstProposal.text, /Maker \(Máquina Estacionária\): Rolls-Royce/);
+    assert.match(bot.sentMessages[0].text, /Dados recebidos gravados na nova linha 3/);
+    assert.match(bot.sentMessages[0].text, /- Motivação/);
+    assert.match(bot.sentMessages[0].text, /- Executor/);
+    assert.match(bot.sentMessages[0].text, /- Coupling GAP/);
+    assert.equal(model.cell(3, 3), 'Wartsila');
+    assert.equal(model.cell(3, 20), 'Rolls-Royce');
 
-    // Participante autorizada envia correções no formato "Campo: valor"
+    // Outra participante do grupo envia atualização/correção SEM citar a mensagem (1 alinhamento aberto)
     await bot.handle({
-      key: { remoteJid: group, id: 'corr-1', participant: isabela },
-      messageTimestamp: ts + 20,
+      key: { remoteJid: group, id: 'corr-no-quote', participant: isabela },
+      messageTimestamp: ts + 15,
       message: {
-        extendedTextMessage: {
-          text: [
-            'Axial Vertical: -0,02 mm',
-            'Maker (Drive Machine): WEG',
-            'Maker (Máquina Estacionária): ABB',
-            'Coupling GAP: 28,15 mm'
-          ].join('\n'),
-          contextInfo: { stanzaId: firstProposal.id }
-        }
+        conversation: [
+          'Axial Vertical: -0,02 mm',
+          'Maker (Drive Machine): WEG',
+          'Maker (Máquina Estacionária): ABB',
+          'Motivação: Preventiva',
+          'Executor: Navship'
+        ].join('\n')
       }
     });
 
-    assert.equal(model.rows.length, 2, 'Não deve gravar na planilha durante correção');
-    assert.equal(bot.sentMessages.length, 2, 'Deve enviar exatamente a nova proposta completa');
-    assert.equal(
-      bot.sentMessages.some(m => m.text === 'Responda “confirmo” para validar todos os dados ou indique as correções no formato “Campo: valor”.'),
-      false,
-      'Não deve repetir mensagem genérica de orientação após correção válida'
-    );
+    assert.equal(model.rows.length, 3, 'Deve atualizar a mesma linha 3');
+    assert.equal(bot.sentMessages.length, 2);
+    assert.match(bot.sentMessages[1].text, /Dados atualizados na linha 3/);
+    assert.doesNotMatch(bot.sentMessages[1].text, /- Motivação/);
+    assert.doesNotMatch(bot.sentMessages[1].text, /- Executor/);
+    assert.match(bot.sentMessages[1].text, /- Axial Horizontal/);
+    assert.match(bot.sentMessages[1].text, /- Radial Vertical/);
+    assert.match(bot.sentMessages[1].text, /- Radial Horizontal/);
+    assert.match(bot.sentMessages[1].text, /- Coupling GAP/);
 
-    const revisedProposal = bot.sentMessages[1];
-    assert.match(revisedProposal.text, /Axial Vertical: -0\.02 mm/);
-    assert.match(revisedProposal.text, /Maker \(Drive Machine\): WEG/);
-    assert.match(revisedProposal.text, /Maker \(Máquina Estacionária\): ABB/);
-    assert.match(revisedProposal.text, /Coupling GAP: 28,15 mm/);
-
-    // Responder à proposta antiga já substituída não grava
+    // Participante responde citando a última mensagem e preenche os 4 campos finais
     await bot.handle({
-      key: { remoteJid: group, id: 'old-quote-attempt', participant: isabela },
-      messageTimestamp: ts + 25,
-      message: {
-        extendedTextMessage: {
-          text: 'confirmo',
-          contextInfo: { stanzaId: firstProposal.id }
-        }
-      }
-    });
-    assert.equal(model.rows.length, 2);
-    assert.match(bot.sentMessages[2].text, /Esta versão foi substituída/);
-
-    // Participante responde "confirmado" citando a proposta corrigida
-    await bot.handle({
-      key: { remoteJid: group, id: 'conf-1', participant: isabela },
+      key: { remoteJid: group, id: 'corr-final', participant: isabela },
       messageTimestamp: ts + 30,
       message: {
         extendedTextMessage: {
-          text: 'confirmado',
-          contextInfo: { stanzaId: revisedProposal.id }
+          text: [
+            'Axial Horizontal: +0,01 mm',
+            'Radial Vertical: 0,02 mm',
+            'Radial Horizontal: -0,01 mm',
+            'Coupling GAP: 28,15 mm'
+          ].join('\n'),
+          contextInfo: { stanzaId: bot.sentMessages[1].id }
         }
       }
     });
 
     assert.equal(model.rows.length, 3);
-    assert.match(bot.sentMessages[3].text, /Dados validados e gravados na linha 3 da planilha\./);
+    assert.equal(bot.sentMessages.length, 3);
+    assert.match(bot.sentMessages[2].text, /Dados atualizados na linha 3/);
+    assert.match(bot.sentMessages[2].text, /Todos os campos obrigatórios foram preenchidos!/);
 
     // Auditoria célula a célula das 24 colunas da linha 3
     assert.equal(model.cell(3, 0), 'BRAM Atlas', 'Vessel');
@@ -388,13 +382,13 @@ test('QA realista 1: fluxo completo em 24 colunas com correção "Campo: valor",
     assert.equal(model.cell(3, 3), 'WEG', 'Maker (Drive)');
     assert.equal(model.cell(3, 4), 'não informado', 'Model (Drive)');
     assert.equal(model.cell(3, 5), '22/11/2026', 'Data');
-    assert.equal(model.cell(3, 6), 'não informado', 'Motivação');
-    assert.equal(model.cell(3, 7), 'não informado', 'Executor');
+    assert.equal(model.cell(3, 6), 'Preventiva', 'Motivação');
+    assert.equal(model.cell(3, 7), 'Navship', 'Executor');
     assert.equal(model.cell(3, 8), 'Laser', 'Método');
     assert.equal(model.cell(3, 9), '-0.02 mm', 'Axial Vertical');
-    assert.equal(model.cell(3, 10), 'não informado', 'Axial Horizontal');
-    assert.equal(model.cell(3, 11), 'não informado', 'Radial Vertical');
-    assert.equal(model.cell(3, 12), '+0.02 mm', 'Radial Horizontal');
+    assert.equal(model.cell(3, 10), '+0.01 mm', 'Axial Horizontal');
+    assert.equal(model.cell(3, 11), '0.02 mm', 'Radial Vertical');
+    assert.equal(model.cell(3, 12), '-0.01 mm', 'Radial Horizontal');
     assert.equal(model.cell(3, 13), '28,15 mm', 'Coupling GAP');
     assert.equal(model.cell(3, 14), 'não informado', 'Padrão');
     assert.equal(model.cell(3, 15), 'não informado', 'Axial Tolerance');
@@ -415,7 +409,7 @@ test('QA realista 1: fluxo completo em 24 colunas com correção "Campo: valor",
   }
 });
 
-test('QA realista 2: atualização de linha existente preserva valores conhecidos, fórmula não mapeada e comentário humano, preenchendo vazios como "não informado"', async () => {
+test('QA realista 2: atualização incremental em linha existente preserva valores conhecidos, fórmula não mapeada e comentário humano, preenchendo vazios como "não informado"', async () => {
   const group = 'grupo-atlas@g.us';
   const user = '5521988887777@s.whatsapp.net';
 
@@ -467,13 +461,9 @@ test('QA realista 2: atualização de linha existente preserva valores conhecido
       }
     });
 
-    await bot.tick();
+    assert.equal(model.rows.length, 3);
     assert.equal(bot.sentMessages.length, 1);
-    const prop1 = bot.sentMessages[0];
-    assert.match(prop1.text, /Destino: linha 3 já existente\./);
-    assert.match(prop1.text, /Maker \(Drive Machine\): Caterpillar \(mantido\)/);
-    assert.match(prop1.text, /Maker \(Máquina Estacionária\): Leroy-Somer \(mantido\)/);
-    assert.match(prop1.text, /Método: Laser \(anterior: Relógio comparador\)/);
+    assert.match(bot.sentMessages[0].text, /Dados atualizados na linha 3/);
 
     await bot.handle({
       key: { remoteJid: group, id: 'upd-corr-1', participant: user },
@@ -481,35 +471,21 @@ test('QA realista 2: atualização de linha existente preserva valores conhecido
       message: {
         extendedTextMessage: {
           text: 'Executor: Equipe Bordo',
-          contextInfo: { stanzaId: prop1.id }
+          contextInfo: { stanzaId: bot.sentMessages[0].id }
         }
       }
     });
 
     assert.equal(bot.sentMessages.length, 2);
-    const prop2 = bot.sentMessages[1];
-    assert.match(prop2.text, /Executor: Equipe Bordo/);
-
-    await bot.handle({
-      key: { remoteJid: group, id: 'upd-conf-1', participant: user },
-      messageTimestamp: ts + 20,
-      message: {
-        extendedTextMessage: {
-          text: 'confirmo',
-          contextInfo: { stanzaId: prop2.id }
-        }
-      }
-    });
-
-    assert.equal(model.rows.length, 3);
-    assert.match(bot.sentMessages[2].text, /Dados validados e gravados na linha 3 da planilha\./);
+    assert.match(bot.sentMessages[1].text, /Dados atualizados na linha 3/);
+    assert.doesNotMatch(bot.sentMessages[1].text, /- Executor/);
 
     assert.equal(model.cell(3, 3), 'Caterpillar', 'Maker Drive preservado');
     assert.equal(model.cell(3, 4), '3516B', 'Model Drive preservado');
-    assert.equal(model.cell(3, 7), 'Equipe Bordo', 'Executor atualizado pela correção');
+    assert.equal(model.cell(3, 7), 'Equipe Bordo', 'Executor atualizado na linha 3');
     assert.equal(model.cell(3, 8), 'Laser', 'Método atualizado');
     assert.equal(model.cell(3, 9), '+0.03 mm', 'Axial Vertical com sinal preservado');
-    assert.equal(model.cell(3, 10), 'não informado', 'Vazio em atualização vira não informado');
+    assert.equal(model.cell(3, 10), 'não informado', 'Vazio em atualização recebe não informado');
     assert.equal(model.cell(3, 18), '=HYPERLINK("https://exemplo.local/laudo","Laudo")', 'Fórmula não mapeada preservada');
     assert.equal(model.cell(3, 20), 'Leroy-Somer', 'Maker Estacionária preservado');
     assert.match(model.cell(3, 23), /^Nota histórica do cliente \| session:/, 'Comentário humano preservado');
@@ -518,7 +494,7 @@ test('QA realista 2: atualização de linha existente preserva valores conhecido
   }
 });
 
-test('QA realista 3: imagem com legenda divergente bloqueia confirmação cega, aceita escolha via "Campo: valor" e grava valor escolhido', async () => {
+test('QA realista 3: imagem com legenda divergente grava demais campos sem gravar valor divergente, cobra resolução e grava escolha na mesma linha', async () => {
   const group = 'grupo-atlas@g.us';
   const user = '5521988887777@s.whatsapp.net';
   const model = createRealisticModelSheet();
@@ -527,6 +503,9 @@ test('QA realista 3: imagem com legenda divergente bloqueia confirmação cega, 
     sheetModel: model,
     fetchHandler: async (_url, options) => {
       const prompt = JSON.parse(options.body).contents[0].parts[0].text;
+      if (prompt.includes('classifica mensagens')) {
+        return geminiJsonResponse({ decision: 'unrelated' });
+      }
       if (prompt.includes('Leia o documento inteiro')) {
         return geminiJsonResponse({
           records: [{
@@ -546,7 +525,7 @@ test('QA realista 3: imagem com legenda divergente bloqueia confirmação cega, 
       if (prompt.includes('Extraia um registro')) {
         return geminiJsonResponse({
           records: [{
-            status: 'ready',
+            status: 'incomplete',
             vessel: { value: 'BRAM Atlas', message: 1, quote: 'BRAM Atlas' },
             equipment: { value: 'MCP 1', message: 1, quote: 'MCP 1' },
             fields: {
@@ -573,47 +552,31 @@ test('QA realista 3: imagem com legenda divergente bloqueia confirmação cega, 
       }
     });
 
-    await bot.tick();
+    assert.equal(model.rows.length, 3);
+    assert.equal(model.cell(3, 5), '22/11/2026', 'Data deve ser gravada imediatamente');
+    assert.equal(model.cell(3, 9), 'não informado', 'Valor divergente não pode ser gravado');
     assert.equal(bot.sentMessages.length, 1);
-    const prop1 = bot.sentMessages[0];
-    assert.match(prop1.text, /Divergência Axial Vertical: legenda -0,05 mm; imagem -0\.01 mm\./);
+    assert.match(bot.sentMessages[0].text, /Divergência em Axial Vertical: legenda -0,05 mm; imagem -0\.01 mm\./);
+    assert.match(bot.sentMessages[0].text, /- Axial Vertical/);
 
-    // Tentativa de confirmação cega antes de resolver divergência é bloqueada
-    await bot.handle({
-      key: { remoteJid: group, id: 'img-blind-conf', participant: user },
-      messageTimestamp: ts + 10,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: prop1.id } } }
-    });
-    assert.equal(model.rows.length, 2);
-    assert.match(bot.sentMessages[1].text, /Ainda há divergências/);
-
-    // Usuário escolhe valor correto no formato "Campo: valor"
+    // Usuário informa escolha correta no formato "Campo: valor"
     await bot.handle({
       key: { remoteJid: group, id: 'img-choice', participant: user },
       messageTimestamp: ts + 20,
-      message: { extendedTextMessage: { text: 'Axial Vertical: -0,01 mm', contextInfo: { stanzaId: prop1.id } } }
-    });
-    assert.equal(bot.sentMessages.length, 3);
-    const prop2 = bot.sentMessages[2];
-    assert.doesNotMatch(prop2.text, /Divergência Axial Vertical/);
-    assert.match(prop2.text, /Axial Vertical: -0\.01 mm/);
-
-    // Confirmação final grava exatamente -0.01 mm
-    await bot.handle({
-      key: { remoteJid: group, id: 'img-conf-final', participant: user },
-      messageTimestamp: ts + 30,
-      message: { extendedTextMessage: { text: 'confirmado', contextInfo: { stanzaId: prop2.id } } }
+      message: { extendedTextMessage: { text: 'Axial Vertical: -0,01 mm', contextInfo: { stanzaId: bot.sentMessages[0].id } } }
     });
 
     assert.equal(model.rows.length, 3);
-    assert.equal(model.cell(3, 9), '-0.01 mm');
-    assert.equal(model.cell(3, 5), '22/11/2026');
+    assert.equal(model.cell(3, 9), '-0.01 mm', 'Valor escolhido gravado na linha 3');
+    assert.equal(bot.sentMessages.length, 2);
+    assert.doesNotMatch(bot.sentMessages[1].text, /Divergência em Axial Vertical/);
+    assert.doesNotMatch(bot.sentMessages[1].text, /- Axial Vertical/);
   } finally {
     bot.cleanup();
   }
 });
 
-test('QA realista 4: falha de leitura do anexo registra pendência, avisa grupo e continua fluxo pela legenda até gravar', async () => {
+test('QA realista 4: falha de leitura do anexo registra pendência, avisa grupo e grava dados da legenda na planilha', async () => {
   const group = 'grupo-atlas@g.us';
   const user = '5521988887777@s.whatsapp.net';
   const model = createRealisticModelSheet();
@@ -660,34 +623,24 @@ test('QA realista 4: falha de leitura do anexo registra pendência, avisa grupo 
       }
     });
 
-    assert.equal(bot.sentMessages.length, 1);
+    assert.equal(bot.sentMessages.length, 2);
     assert.match(bot.sentMessages[0].text, /Não consegui ler o anexo enviado/);
+    assert.match(bot.sentMessages[1].text, /A leitura do anexo falhou ou ficou incompleta; os dados da legenda foram gravados\./);
 
     const pending = bot.readPending();
     assert.ok(pending.some(item => String(item.reason || '').includes('não foi possível ler o anexo')));
 
-    await bot.tick();
-    assert.equal(bot.sentMessages.length, 2);
-    const prop = bot.sentMessages[1];
-    assert.match(prop.text, /A leitura do anexo falhou ou ficou incompleta/);
-    assert.match(prop.text, /Axial Vertical: \+0,04 mm/);
-
-    await bot.handle({
-      key: { remoteJid: group, id: 'fail-doc-conf', participant: user },
-      messageTimestamp: ts + 15,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: prop.id } } }
-    });
-
     assert.equal(model.rows.length, 3);
     assert.equal(model.cell(3, 0), 'BRAM Atlas');
     assert.equal(model.cell(3, 1), 'MCP 1');
+    assert.equal(model.cell(3, 5), '22/11/2026');
     assert.equal(model.cell(3, 9), '+0,04 mm');
   } finally {
     bot.cleanup();
   }
 });
 
-test('QA realista 5: múltiplos equipamentos, mensagem duplicada, retomada após erro 503 no Sheets e bloqueio pós-gravação divergente', async () => {
+test('QA realista 5: múltiplos equipamentos, mensagem duplicada, 2 abertos exigem Responder, retomada após erro 503 e verificação pós-gravação', async () => {
   const group = 'grupo-breeze@g.us';
   const user = '5521988887777@s.whatsapp.net';
   const model = createRealisticModelSheet();
@@ -698,6 +651,9 @@ test('QA realista 5: múltiplos equipamentos, mensagem duplicada, retomada após
     fetchHandler: async (_url, options) => {
       const body = JSON.parse(options.body);
       const prompt = body.contents[0].parts[0].text;
+      if (prompt.includes('classifica mensagens')) {
+        return geminiJsonResponse({ decision: 'unrelated' });
+      }
       if (body.contents[0].parts.length > 1 && prompt.includes('Leia o documento inteiro')) {
         inspectCalls += 1;
         return geminiJsonResponse({
@@ -722,13 +678,13 @@ test('QA realista 5: múltiplos equipamentos, mensagem duplicada, retomada após
         return geminiJsonResponse({
           records: [
             {
-              status: 'ready',
+              status: 'incomplete',
               vessel: { value: 'BRAM Breeze', message: 1, quote: 'BRAM Breeze' },
               equipment: { value: 'Diesel Generator #1', message: 1, quote: 'Diesel Generator #1' },
               fields: { coupling_gap: { value: '21,10 mm', message: 1, quote: '21,10 mm' } }
             },
             {
-              status: 'ready',
+              status: 'incomplete',
               vessel: { value: 'BRAM Breeze', message: 1, quote: 'BRAM Breeze' },
               equipment: { value: 'Diesel Generator #2', message: 1, quote: 'Diesel Generator #2' },
               fields: { coupling_gap: { value: '22,20 mm', message: 1, quote: '22,20 mm' } }
@@ -760,59 +716,56 @@ test('QA realista 5: múltiplos equipamentos, mensagem duplicada, retomada após
     await bot.handle(pdfMsg);
     assert.equal(inspectCalls, 1);
 
-    await bot.tick();
-    assert.equal(bot.sentMessages.length, 2);
-    const dg1Prop = bot.sentMessages.find(m => m.text.includes('Diesel Generator #1'));
-    const dg2Prop = bot.sentMessages.find(m => m.text.includes('Diesel Generator #2'));
-    assert.ok(dg1Prop && dg2Prop);
-
-    // Simula falha transitória 503 do Google Sheets na primeira tentativa de confirmação do DG #1
-    model.state.failNextAppend = Object.assign(new Error('Service Unavailable'), { code: 503 });
-    await bot.handle({
-      key: { remoteJid: group, id: 'dg1-conf-fail', participant: user },
-      messageTimestamp: ts + 10,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: dg1Prop.id } } }
-    });
-    assert.equal(model.rows.length, 2, 'Erro transitório não pode gravar parcialmente');
-    assert.match(bot.sentMessages[2].text, /Não consegui concluir a confirmação com o Google Sheets/);
-
-    // Retomada: novo "confirmo" grava DG #1 na linha 3
-    await bot.handle({
-      key: { remoteJid: group, id: 'dg1-conf-retry', participant: user },
-      messageTimestamp: ts + 20,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: dg1Prop.id } } }
-    });
-    assert.equal(model.rows.length, 3);
+    assert.equal(model.rows.length, 4);
     assert.equal(model.cell(3, 1), 'Diesel Generator #1');
     assert.equal(model.cell(3, 13), '21,10 mm');
-
-    // DG #2 grava em sequência na linha 4
-    await bot.handle({
-      key: { remoteJid: group, id: 'dg2-conf-ok', participant: user },
-      messageTimestamp: ts + 30,
-      message: { extendedTextMessage: { text: 'confirmado', contextInfo: { stanzaId: dg2Prop.id } } }
-    });
-    assert.equal(model.rows.length, 4);
     assert.equal(model.cell(4, 1), 'Diesel Generator #2');
     assert.equal(model.cell(4, 13), '22,20 mm');
+    assert.equal(bot.sentMessages.length, 2);
 
-    // Reconfirmar DG #1 já respondido avisa e não duplica linha
+    const dg1Prop = bot.sentMessages.find(m => m.text.includes('Diesel Generator #1'));
+    assert.ok(dg1Prop);
+
+    // Sem citar quando há 2 alinhamentos em aberto: bot orienta usar "Responder"
     await bot.handle({
-      key: { remoteJid: group, id: 'dg1-conf-dup', participant: user },
-      messageTimestamp: ts + 40,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: dg1Prop.id } } }
+      key: { remoteJid: group, id: 'ambig-no-quote', participant: user },
+      messageTimestamp: ts + 5,
+      message: { conversation: 'Executor: Navship' }
     });
-    assert.equal(model.rows.length, 4);
-    assert.match(bot.sentMessages[5].text, /já foi validada e gravada/);
+    assert.match(bot.sentMessages[2].text, /Há mais de um alinhamento em aberto\. Use “Responder”/);
+    assert.equal(model.cell(3, 7), 'não informado');
+    assert.equal(model.cell(4, 7), 'não informado');
+
+    // Simula erro transitório 503 do Sheets no batchUpdate ao responder DG #1
+    model.state.failNextBatchUpdate = Object.assign(new Error('Service Unavailable'), { code: 503 });
+    await bot.handle({
+      key: { remoteJid: group, id: 'dg1-upd-fail', participant: user },
+      messageTimestamp: ts + 10,
+      message: { extendedTextMessage: { text: 'Executor: Navship', contextInfo: { stanzaId: dg1Prop.id } } }
+    });
+    assert.match(bot.sentMessages[3].text, /Não consegui concluir a gravação no Google Sheets/);
+    assert.equal(model.cell(3, 7), 'não informado');
+
+    // Retomada com novo messageId grava Executor na linha 3
+    await bot.handle({
+      key: { remoteJid: group, id: 'dg1-upd-retry', participant: user },
+      messageTimestamp: ts + 20,
+      message: { extendedTextMessage: { text: 'Executor: Navship', contextInfo: { stanzaId: dg1Prop.id } } }
+    });
+    assert.equal(model.cell(3, 7), 'Navship');
+    assert.match(bot.sentMessages[4].text, /Dados atualizados na linha 3/);
 
     // Verificação pós-gravação detecta divergência caso a planilha retorne dado diferente do escrito
     model.state.corruptNextAppend = true;
+    const rev = crypto.createHash('sha256')
+      .update(JSON.stringify(['bram breeze', 'dg3', REALISTIC_GROUPS, REALISTIC_HEADERS, undefined, {}]))
+      .digest('hex');
     await assert.rejects(
       () => recordHistory(model.sheets, 'records-id', {
         vessel: 'BRAM Breeze',
         equipment: 'Diesel Generator #3',
         axial_vertical: '0.01 mm'
-      }, 'sess-dg3', { target: { row: null, revision: model.rows.length >= 2 ? require('node:crypto').createHash('sha256').update(JSON.stringify(['bram breeze', 'dg3', REALISTIC_GROUPS, REALISTIC_HEADERS, undefined, {}])).digest('hex') : 'x', current: {} }, confirmationId: 'conf-dg3' }),
+      }, 'sess-dg3', { target: { row: null, revision: rev, current: {} }, confirmationId: 'conf-dg3' }),
       /Gravação não verificada na planilha/
     );
   } finally {
@@ -820,24 +773,23 @@ test('QA realista 5: múltiplos equipamentos, mensagem duplicada, retomada após
   }
 });
 
-test('QA realista 6: caracterização de cenários que geram repetição de aviso ou não gravação (evidência sem presumir causa)', async () => {
+test('QA realista 6: restrição opcional de remetente e diagnóstico claro para aspas ou unidade ausente sem loop', async () => {
   const group = 'grupo-atlas@g.us';
   const requester = '5521911112222@s.whatsapp.net';
   const isabela = '5521988887777@s.whatsapp.net';
 
-  // (a) Sem AUTHORIZED_APPROVERS, outro participante recebe repetidamente bloqueio de autorização
+  // (a) Quando RESTRICT_CONFIRMATION_TO_REQUESTER=true, outro participante é bloqueado
   const modelA = createRealisticModelSheet();
   const botA = bootRealisticBot({
+    env: { RESTRICT_CONFIRMATION_TO_REQUESTER: 'true' },
     sheetModel: modelA,
     fetchHandler: async (_url, options) => {
       const prompt = JSON.parse(options.body).contents[0].parts[0].text;
-      if (prompt.includes('classifica mensagens')) {
-        return geminiJsonResponse({ decision: 'unrelated' });
-      }
+      if (prompt.includes('classifica mensagens')) return geminiJsonResponse({ decision: 'unrelated' });
       if (prompt.includes('Extraia um registro')) {
         return geminiJsonResponse({
           records: [{
-            status: 'ready',
+            status: 'incomplete',
             vessel: { value: 'BRAM Atlas', message: 1, quote: 'BRAM Atlas' },
             equipment: { value: 'MCP 1', message: 1, quote: 'MCP 1' },
             fields: { axial_vertical: { value: '-0.02 mm', message: 1, quote: '-0.02 mm' } }
@@ -852,42 +804,32 @@ test('QA realista 6: caracterização de cenários que geram repetição de avis
     await botA.handle({
       key: { remoteJid: group, id: 'a-1', participant: requester },
       messageTimestamp: ts,
-      message: { extendedTextMessage: { text: '@bot BRAM Atlas MCP 1 -0.02 mm', contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] } } }
+      message: { extendedTextMessage: { text: '@bot BRAM Atlas MCP 1 Axial Vertical: -0.02 mm', contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] } } }
     });
-    await botA.tick();
     const propA = botA.sentMessages[0];
 
     await botA.handle({
       key: { remoteJid: group, id: 'a-2', participant: isabela },
       messageTimestamp: ts + 5,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: propA.id } } }
-    });
-    await botA.handle({
-      key: { remoteJid: group, id: 'a-3', participant: isabela },
-      messageTimestamp: ts + 10,
       message: { extendedTextMessage: { text: 'Axial Vertical: -0,01 mm', contextInfo: { stanzaId: propA.id } } }
     });
-    assert.equal(modelA.rows.length, 2);
     assert.match(botA.sentMessages[1].text, /Somente a pessoa que solicitou/);
-    assert.match(botA.sentMessages[2].text, /Somente a pessoa que solicitou/);
+    assert.equal(modelA.cell(3, 9), '-0.02 mm', 'Valor não pode ser alterado por não autorizado');
   } finally {
     botA.cleanup();
   }
 
-  // (b) e (c) Com participante autorizada: aspas, @bot junto ao confirmo ou envio sem responder/citar (stanzaId ausente)
+  // (b) Com permissão normal: campo com aspas e medição sem unidade geram avisos específicos sem corromper células
   const modelB = createRealisticModelSheet();
   const botB = bootRealisticBot({
-    env: { AUTHORIZED_APPROVERS: '5521988887777' },
     sheetModel: modelB,
     fetchHandler: async (_url, options) => {
       const prompt = JSON.parse(options.body).contents[0].parts[0].text;
-      if (prompt.includes('classifica mensagens')) {
-        return geminiJsonResponse({ decision: 'unrelated' });
-      }
+      if (prompt.includes('classifica mensagens')) return geminiJsonResponse({ decision: 'unrelated' });
       if (prompt.includes('Extraia um registro')) {
         return geminiJsonResponse({
           records: [{
-            status: 'ready',
+            status: 'incomplete',
             vessel: { value: 'BRAM Atlas', message: 1, quote: 'BRAM Atlas' },
             equipment: { value: 'MCP 1', message: 1, quote: 'MCP 1' },
             fields: { axial_vertical: { value: '-0.02 mm', message: 1, quote: '-0.02 mm' } }
@@ -902,48 +844,25 @@ test('QA realista 6: caracterização de cenários que geram repetição de avis
     await botB.handle({
       key: { remoteJid: group, id: 'b-1', participant: requester },
       messageTimestamp: ts,
-      message: { extendedTextMessage: { text: '@bot BRAM Atlas MCP 1 -0.02 mm', contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] } } }
+      message: { extendedTextMessage: { text: '@bot BRAM Atlas MCP 1 Axial Vertical: -0.02 mm', contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] } } }
     });
-    await botB.tick();
     const propB = botB.sentMessages[0];
 
-    // Aspas envolvendo "Campo: valor" ou "@bot confirmo" falham no parser e acionam mensagens repetidas de orientação
     await botB.handle({
       key: { remoteJid: group, id: 'b-2', participant: isabela },
       messageTimestamp: ts + 5,
-      message: { extendedTextMessage: { text: '“Axial Vertical: -0,01 mm”', contextInfo: { stanzaId: propB.id } } }
-    });
-    await botB.handle({
-      key: { remoteJid: group, id: 'b-2b', participant: isabela },
-      messageTimestamp: ts + 8,
       message: { extendedTextMessage: { text: '“Maker: WEG”', contextInfo: { stanzaId: propB.id } } }
     });
     await botB.handle({
       key: { remoteJid: group, id: 'b-3', participant: isabela },
       messageTimestamp: ts + 10,
-      message: { extendedTextMessage: { text: '@bot confirmo', contextInfo: { stanzaId: propB.id } } }
+      message: { extendedTextMessage: { text: 'Radial Vertical: 0,05', contextInfo: { stanzaId: propB.id } } }
     });
-    assert.equal(
-      botB.sentMessages[1].text,
-      'Informe a unidade da medição (ex.: “Axial Vertical: -0,01 mm”).'
-    );
-    assert.equal(
-      botB.sentMessages[2].text,
-      'Responda “confirmo” para validar todos os dados ou indique as correções no formato “Campo: valor”.'
-    );
-    assert.equal(
-      botB.sentMessages[3].text,
-      'Responda “confirmo” para validar todos os dados ou indique as correções no formato “Campo: valor”.'
-    );
 
-    // Envio de "confirmo" sem citar a mensagem de conferência (sem stanzaId) não aciona gravação
-    await botB.handle({
-      key: { remoteJid: group, id: 'b-4', participant: isabela },
-      messageTimestamp: ts + 15,
-      message: { conversation: 'confirmo' }
-    });
-    await botB.tick();
-    assert.equal(modelB.rows.length, 2);
+    assert.match(botB.sentMessages[1].text, /Campo não reconhecido: “Maker/);
+    assert.match(botB.sentMessages[2].text, /Informe um valor válido e a unidade para: Radial Vertical/);
+    assert.equal(modelB.cell(3, 3), 'não informado');
+    assert.equal(modelB.cell(3, 11), 'não informado');
   } finally {
     botB.cleanup();
   }
