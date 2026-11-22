@@ -4,19 +4,22 @@ set -Eeuo pipefail
 TARGET_SHA="${1:?target commit SHA is required}"
 APP_DIR="/home/matheus_cordeirorf/AyaAhdi-bot"
 SERVICE="alinhamento-bot.service"
+APP_USER="matheus_cordeirorf"
 
-cd "$APP_DIR"
+run_as_app() {
+  sudo -n -u "$APP_USER" -- bash -c 'cd "$1" && shift && exec "$@"' _ "$APP_DIR" "$@"
+}
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
+if ! run_as_app git diff --quiet || ! run_as_app git diff --cached --quiet; then
   echo "Refusing to deploy over tracked local changes in $APP_DIR" >&2
   exit 1
 fi
 
-git fetch --no-tags origin master
-git cat-file -e "${TARGET_SHA}^{commit}"
-git merge-base --is-ancestor "$TARGET_SHA" origin/master
+run_as_app git fetch --no-tags origin master
+run_as_app git cat-file -e "${TARGET_SHA}^{commit}"
+run_as_app git merge-base --is-ancestor "$TARGET_SHA" origin/master
 
-PREVIOUS_SHA="$(git rev-parse HEAD)"
+PREVIOUS_SHA="$(run_as_app git rev-parse HEAD)"
 if [[ "$PREVIOUS_SHA" == "$TARGET_SHA" ]]; then
   echo "Commit $TARGET_SHA is already deployed."
   exit 0
@@ -48,8 +51,8 @@ rollback_on_failure() {
   set +e
   echo "Deployment failed; restoring $PREVIOUS_SHA." >&2
   sudo systemctl stop "$SERVICE"
-  git reset --hard "$PREVIOUS_SHA"
-  npm install --omit=dev --no-audit --no-fund
+  run_as_app git reset --hard "$PREVIOUS_SHA"
+  run_as_app npm install --omit=dev --no-audit --no-fund
   local rollback_started_at
   rollback_started_at="$(date --iso-8601=seconds)"
   sudo systemctl start "$SERVICE"
@@ -63,8 +66,8 @@ rollback_on_failure() {
 trap rollback_on_failure EXIT
 
 sudo systemctl stop "$SERVICE"
-git reset --hard "$TARGET_SHA"
-npm install --omit=dev --no-audit --no-fund
+run_as_app git reset --hard "$TARGET_SHA"
+run_as_app npm install --omit=dev --no-audit --no-fund
 DEPLOY_STARTED_AT="$(date --iso-8601=seconds)"
 sudo systemctl start "$SERVICE"
 if ! wait_for_health "$DEPLOY_STARTED_AT"; then
