@@ -106,8 +106,8 @@ function dateIdentity(value) {
   return '';
 }
 
-async function readHistory(sheets, spreadsheetId) {
-  const { data } = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${TAB}!A1:ZZ` });
+async function readHistory(sheets, spreadsheetId, unformatted = false) {
+  const { data } = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${TAB}!A1:ZZ`, ...(unformatted ? {valueRenderOption:'UNFORMATTED_VALUE'} : {}) });
   const rows = data.values || [];
   const schema = mapHeaders(rows);
   const { cols } = schema;
@@ -222,7 +222,7 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { target, c
     });
     const updatedRange = appended.updates?.updatedRange;
     const rowNumber = Number(updatedRange?.match(/!\$?[A-Z]+\$?(\d+)/)?.[1]) || undefined;
-    const verified = await readHistory(sheets, spreadsheetId);
+    const verified = await readHistory(sheets, spreadsheetId, true);
     const actual = rowNumber && verified.rows[rowNumber - 1];
     if (!actual || values.some(({column, value}) => String(actual[column] ?? '') !== String(value))) throw new Error('Gravação não verificada na planilha');
     return { status: 'appended', row: rowNumber };
@@ -237,7 +237,7 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { target, c
       }))
     }
   });
-  const verified = await readHistory(sheets, spreadsheetId);
+  const verified = await readHistory(sheets, spreadsheetId, true);
   const actual = verified.rows[row - 1];
   if (!actual || values.some(({column, value}) => String(actual[column] ?? '') !== String(value))) throw new Error('Gravação não verificada na planilha');
   return { status: 'updated', row };

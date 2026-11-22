@@ -28,7 +28,26 @@ test('correção exige campo e preserva sinal e decimal',()=>{
    {key:'maker',value:'WEG'},{key:'stationary_maker',value:'ABB'}
  ]);
  assert.equal(isApproval('confirmo'),true);
+ assert.equal(isApproval('confirmado, pode gravar'),true);
+ assert.equal(isApproval('confirmo os dados'),true);
+ assert.equal(isApproval('confirmado os dados'),true);
+ assert.equal(isApproval('@999888777 confirmado'),true);
+ assert.deepEqual(parseCorrection('@999888777\naxial vertical: -0.01\nexecutor: navship',[{field:'Axial Vertical',caption:'-0.015 mm',visual:'-0.01 mm'}]),[{key:'axial_vertical',value:'-0.01 mm'},{key:'executor',value:'navship'}]);
+ assert.deepEqual(parseCorrection('axial vertical: -0.01').invalidFields,['axial vertical']);
+ assert.deepEqual(parseCorrection('axial vertical: -0.01',[{field:'Axial Vertical',caption:'-0.015 mm',visual:'-0.01 cm'}]).invalidFields,['axial vertical']);
  assert.equal(isApproval('confirmo?'),false);
  assert.equal(isApproval('sim, correto'),true);
  assert.equal(isApproval('não, axial vertical: -0.01 mm'),false);
+});
+
+test('deduplica conteúdo idêntico após mensagem nova e mantém proposta aberta',()=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'confirm-')); const file=path.join(dir,'state.json');
+ try {
+  const c=createConfirmations(file), p={data:{vessel:'Joe Griffin'},conflicts:[],target:{revision:'1'},text:'confira',sourceVersion:'a'};
+  const first=c.prepare('g','s',p); c.sent(first.key,'m1');
+  assert.equal(c.prepare('g','s',{...p,sourceVersion:'b'}),null);
+  assert.equal(c.lookup('g','m1')[1].status,'sent');
+  assert.equal(c.latestOpen('g')[0].messageId,'m1');
+  assert.deepEqual(parseCorrection('campo inventado: valor').unknownFields,['campo inventado']);
+ } finally {fs.rmSync(dir,{recursive:true,force:true});}
 });

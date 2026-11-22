@@ -214,6 +214,7 @@ function bootVirtualBot({ env = {}, fetchHandler, sheets, initialRows = null, ba
 test('E2E virtual: texto pré-anexo + PDF octet-stream + menção -> proposta -> bloqueio 3o -> aprovação e auditoria no Sheets', async () => {
   const geminiRequests = [];
   const bot = bootVirtualBot({
+    env: {RESTRICT_CONFIRMATION_TO_REQUESTER:'true'},
     fetchHandler: async (_url, options) => {
       const body = JSON.parse(options.body);
       const prompt = body.contents[0].parts[0].text;
@@ -328,7 +329,7 @@ test('E2E virtual: texto pré-anexo + PDF octet-stream + menção -> proposta ->
     await bot.handle({
       key: { remoteJid: group, id: 'm3', participant: '5521999999999@s.whatsapp.net' },
       messageTimestamp: ts + 10,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: reviewMsg.id } } }
+      message: { conversation: 'confirmo' }
     });
     assert.equal(bot.rows.length, 2);
     assert.match(bot.sentMessages[1].text, /Somente a pessoa que solicitou/);
@@ -369,6 +370,9 @@ test('E2E virtual: AUTHORIZED_APPROVERS e ALLOWED_GROUP_JIDS restringem quem apr
     },
     fetchHandler: async (_url, options) => {
       const prompt = JSON.parse(options.body).contents[0].parts[0].text;
+      if (prompt.includes('classifica mensagens')) {
+        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"decision":"unrelated"}' }] } }] }) };
+      }
       if (prompt.includes('Extraia um registro')) {
         return {
           ok: true,
@@ -478,6 +482,9 @@ test('E2E virtual: divergência PRUFTECHNIK (fieldKeys) bloqueia confirmação c
           })
         };
       }
+      if (prompt.includes('classifica mensagens')) {
+        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"decision":"unrelated"}' }] } }] }) };
+      }
       if (prompt.includes('Extraia um registro')) {
         return {
           ok: true,
@@ -535,31 +542,38 @@ test('E2E virtual: divergência PRUFTECHNIK (fieldKeys) bloqueia confirmação c
     assert.equal(bot.rows.length, 2);
     assert.match(bot.sentMessages[1].text, /Ainda há divergências/);
 
-    // Enviar correção sem unidade recebe instrução clara
+    // Mensagens paralelas com ":" sem quote (link ou horário) não interrompem com erro de campo desconhecido
     await bot.handle({
-      key: { remoteJid: group, id: 'c2', participant: user },
+      key: { remoteJid: group, id: 'chat-url', participant: user },
       messageTimestamp: ts + 6,
-      message: { extendedTextMessage: { text: 'Axial Vertical: -0,01', contextInfo: { stanzaId: review1.id } } }
+      message: { conversation: 'https://docs.google.com/spreadsheets/d/123' }
     });
-    assert.match(bot.sentMessages[2].text, /Informe a unidade da medição/);
+    await bot.handle({
+      key: { remoteJid: group, id: 'chat-hora', participant: user },
+      messageTimestamp: ts + 6,
+      message: { conversation: 'Horário: 15h' }
+    });
+    assert.equal(bot.sentMessages.length, 2);
 
-    // Enviar correção completa gera nova conferência limpa e permite gravar
+    // Correção sem unidade herda mm da divergência e inclui o executor.
     await bot.handle({
       key: { remoteJid: group, id: 'c3', participant: user },
       messageTimestamp: ts + 7,
-      message: { extendedTextMessage: { text: 'Axial Vertical: -0,01 mm', contextInfo: { stanzaId: review1.id } } }
+      message: { conversation: '@999888777\naxial vertical: -0.01\nexecutor: navship' }
     });
-    const review2 = bot.sentMessages[3];
+    const review2 = bot.sentMessages[2];
     assert.match(review2.text, /Axial Vertical: -0\.01 mm/);
+    assert.match(review2.text, /Executor: navship/);
     assert.doesNotMatch(review2.text, /Divergência Axial Vertical/);
 
     await bot.handle({
       key: { remoteJid: group, id: 'c4', participant: user },
       messageTimestamp: ts + 8,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: review2.id } } }
+      message: { conversation: '@999888777 confirmado' }
     });
     assert.equal(bot.rows.length, 3);
     assert.equal(bot.rows[2][6], '-0.01 mm');
+    assert.equal(bot.rows[2][5], 'navship');
     assert.equal(bot.rows[2][8], '-0.35 mm');
   } finally {
     bot.cleanup();
@@ -592,6 +606,9 @@ test('E2E virtual: 4 geradores novos no mesmo relatório gravam em sequência se
       }
       if (prompt.includes('período geral') || prompt.includes('GAP do acoplamento')) {
         return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{}' }] } }] }) };
+      }
+      if (prompt.includes('classifica mensagens')) {
+        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"decision":"unrelated"}' }] } }] }) };
       }
       if (prompt.includes('Extraia um registro')) {
         return {
@@ -658,7 +675,10 @@ test('E2E virtual: 4 geradores novos no mesmo relatório gravam em sequência se
       initialRows: bot.rows,
       fetchHandler: async (_url, options) => {
         const prompt = JSON.parse(options.body).contents[0].parts[0].text;
-        if (prompt.includes('Extraia um registro')) {
+        if (prompt.includes('classifica mensagens')) {
+        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"decision":"unrelated"}' }] } }] }) };
+      }
+      if (prompt.includes('Extraia um registro')) {
           return {
             ok: true,
             json: async () => ({
@@ -796,13 +816,27 @@ test('E2E virtual: grupos concorrentes não bloqueiam nem vazam estado entre si'
     const msgA = bot.sentMessages.find(m => m.group === 'grupo-a@g.us');
     assert.ok(msgA);
 
-    // Tentativa cruzada (id de msg do Grupo B citado no Grupo A) não grava nem altera
+    // Responder com quote a uma mensagem que NÃO é a conferência do grupo (colega ou outro grupo) NÃO pode confirmar acidentalmente
     await bot.handle({
       key: { remoteJid: 'grupo-a@g.us', id: 'cross-group', participant: 'userB@s.whatsapp.net' },
       messageTimestamp: ts + 5,
       message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: msgB.id } } }
     });
+    await bot.handle({
+      key: { remoteJid: 'grupo-a@g.us', id: 'quote-colega', participant: 'userA@s.whatsapp.net' },
+      messageTimestamp: ts + 6,
+      message: { extendedTextMessage: { text: 'ok', contextInfo: { stanzaId: 'msg-de-colega' } } }
+    });
     assert.equal(bot.rows.length, 3);
+
+    // Sem quote, aprovação explícita no próprio grupo confirma a única proposta aberta
+    await bot.handle({
+      key: { remoteJid: 'grupo-a@g.us', id: 'direct-confirm-a', participant: 'userA@s.whatsapp.net' },
+      messageTimestamp: ts + 7,
+      message: { conversation: 'confirmo' }
+    });
+    assert.equal(bot.rows.length, 4);
+    assert.equal(bot.rows[3][0], 'BRAM Atlas');
   } finally {
     bot.cleanup();
   }
@@ -868,6 +902,9 @@ test('E2E virtual: regressões (Glossário com Bordo, período de datas, verifyE
   const bot = bootVirtualBot({
     fetchHandler: async (_url, options) => {
       const prompt = JSON.parse(options.body).contents[0].parts[0].text;
+      if (prompt.includes('classifica mensagens')) {
+        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"decision":"unrelated"}' }] } }] }) };
+      }
       if (prompt.includes('Extraia um registro')) {
         return {
           ok: true,

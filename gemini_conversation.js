@@ -145,8 +145,8 @@ function createTracker({
         return decision;
       });
     },
-    tick: async () => {
-      const groups = Object.keys(sessions);
+    tick: async (targetGroup = null) => {
+      const groups = targetGroup ? (sessions[targetGroup] ? [targetGroup] : []) : Object.keys(sessions);
       await Promise.all(groups.map(group => enqueueGroup(group, async () => {
         await expireGroup(group, now());
         const session = sessions[group];

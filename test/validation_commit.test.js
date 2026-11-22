@@ -83,10 +83,10 @@ test('destino alterado exige nova conferência e não confirma gravação',async
   assert.match(h.replies[1].text,/linha 3 já existente/);
 });
 
-test('outra pessoa não pode confirmar a proposta',async()=>{
+test('outra pessoa pode confirmar a proposta por padrão',async()=>{
   const h=harness({...proposal(),conflicts:[]});
   const msg=reply('confirmo'); msg.key.participant='outra@s.whatsapp.net';
   await h.handle(h.sock,msg);
-  assert.equal(h.writes.length,0);
-  assert.match(h.replies[0].text,/Somente a pessoa/);
+  assert.equal(h.writes.length,1);
+  assert.equal(h.writes[0].data.approvedBy,'outra@s.whatsapp.net');
 });

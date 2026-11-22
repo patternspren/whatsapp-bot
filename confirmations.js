@@ -46,8 +46,10 @@ function createConfirmations(file) {
   return {
     prepare(group, sessionId, proposal) {
       const canonical = JSON.stringify({group, sessionId, data:proposal.data, conflicts:proposal.conflicts,
-        target:proposal.target?.revision, sourceVersion:proposal.sourceVersion, parentKey:proposal.parentKey, text:proposal.text});
+        target:proposal.target?.revision, parentKey:proposal.parentKey, text:proposal.text});
       const key = crypto.createHash('sha256').update(canonical).digest('hex');
+      if (Object.values(state).some(item => item.status === 'sent' && item.group === group && item.sessionId === sessionId &&
+        JSON.stringify([item.data,item.conflicts,item.target?.revision,item.text]) === JSON.stringify([proposal.data,proposal.conflicts,proposal.target?.revision,proposal.text]))) return null;
       if (state[key]?.status === 'sent') return null;
       if (state[key]?.status === 'answered') return null;
       if (!proposal.parentKey && proposal.sourceVersion && Object.values(state).some(item =>
@@ -71,6 +73,10 @@ function createConfirmations(file) {
     lookup(group, quotedId) {
       return Object.entries(state).find(([,v]) => v.group===group && v.messageId===quotedId && ['sent','answered','superseded'].includes(v.status)) || null;
     },
+    latestOpen(group) {
+      return Object.values(state).filter(v => v.group === group && v.status === 'sent' &&
+        (!v.createdAt || Date.now() - v.createdAt <= 24 * 60 * 60 * 1000)).sort((a,b) => (b.createdAt || 0) - (a.createdAt || 0));
+    },
     done(key, responseId, status='answered', approvedBy='') {
       if (!state[key]) return;
       state[key].status=status;
@@ -82,9 +88,13 @@ function createConfirmations(file) {
   };
 }
 
-function parseCorrection(text, conflicts = []) {
+const stripMentions = text => String(text || '').replace(/@\d+\b/g, '').trim();
+
+function parseCorrection(text, conflicts = [], data = {}) {
   const corrections = [];
-  const source = String(text || '');
+  const unknownFields = [];
+  const invalidFields = [];
+  const source = stripMentions(text);
   const labels = [...new Set(Object.keys(FIELDS).sort((a,b) => b.length-a.length))];
   for (const line of source.split(/\r?\n/)) {
     const match = line.trim().match(/^([^:=]+)\s*[:=]\s*(.+?)\s*$/);
@@ -96,12 +106,23 @@ function parseCorrection(text, conflicts = []) {
     if (/stationary|estacionaria/.test(group)) {
       key = ({class:'stationary_class',maker:'stationary_maker',model:'stationary_model'})[key] || key;
     }
+    if (!key) unknownFields.push(match[1].trim());
     if (key) {
       let value = match[2].trim();
       if (['axial_vertical','axial_horizontal','radial_vertical','radial_horizontal'].includes(key)) {
-        const measured = value.match(/^([+-]?\d+(?:[.,]\d+)?)\s*(mm|cm|µm|μm|um|mils?|in|pol)$/i);
-        if (!measured) continue;
-        value = `${measured[1].replace(',', '.')} ${measured[2].toLowerCase()}`;
+        const measured = value.match(/^([+-]?\d+(?:[.,]\d+)?)\s*(mm|cm|µm|μm|um|mils?|in|pol)?$/i);
+        if (!measured) { invalidFields.push(match[1].trim()); continue; }
+        let unit = measured[2];
+        if (!unit) {
+          const evidence = [data[key], ...conflicts.filter(c => FIELD_KEYS[fold(c.field)] === key).flatMap(c => [c.caption,c.visual])];
+          const units = [...new Set(evidence.flatMap(v => {
+            const m = String(v || '').match(/[+-]?\d+(?:[.,]\d+)?\s*(mm|cm|µm|μm|um|mils?|in|pol)\b/i);
+            return m ? [m[1].toLowerCase().replace('μ','µ')] : [];
+          }))];
+          if (units.length === 1) [unit] = units;
+        }
+        if (!unit) { invalidFields.push(match[1].trim()); continue; }
+        value = `${measured[1].replace(',', '.')} ${unit.toLowerCase()}`;
       }
       corrections.push({key, value});
     }
@@ -121,14 +142,20 @@ function parseCorrection(text, conflicts = []) {
     if (key && bare) corrections.push({key, value:bare[1].replace(',', '.') + ' mm'});
   }
   const seen = new Set();
-  return corrections.filter(change => {
+  const result = corrections.filter(change => {
     if (seen.has(change.key)) return false;
     seen.add(change.key);
     return true;
   });
+  Object.defineProperty(result, 'unknownFields', {value:unknownFields});
+  Object.defineProperty(result, 'invalidFields', {value:invalidFields});
+  return result;
 }
 
 function isApproval(text) {
+  text = stripMentions(text);
+  if (/\?|\bn[aã]o\b/i.test(String(text || ''))) return false;
+  if (/^confirm(?:o|ad[oa])\s+(?:os\s+)?dados[.!\s]*$/i.test(String(text || '').trim())) return true;
   return /^(?:(?:sim|ok|confirmo|confirmado|correto|corretos|certo|certa|aprovado|aprovada)(?:[,;:\s]+(?:sim|ok|confirmo|confirmado|correto|corretos|certo|certa|está correto|esta correto|está certo|esta certo|pode registrar|pode gravar|aprovado|aprovada))?|está correto|esta correto|está certo|esta certo|tudo certo|pode registrar|pode gravar)[.!\s]*$/i.test(String(text || '').trim());
 }
 

@@ -178,8 +178,8 @@ function isAuthorizedForConfirmation(msg, entry) {
   if (authorizedApprovers.length) {
     return senders.some(sender => authorizedApprovers.some(allowed => approverMatches(sender, allowed)));
   }
-  if (!entry.authorizedSender) return false;
-  return senders.some(sender => jidDigits(sender) === jidDigits(entry.authorizedSender));
+  if (process.env.RESTRICT_CONFIRMATION_TO_REQUESTER === 'true') return !!entry.authorizedSender && senders.some(sender => jidDigits(sender) === jidDigits(entry.authorizedSender));
+  return true;
 }
 
 function explicitlyMentionsBot(sock, content) {
@@ -322,17 +322,35 @@ if (geminiEnabled) {
           observations: Object.entries(extracted).filter(([key]) => /antes do ajuste|unidade das medições/i.test(key))
             .map(([key, value]) => `${key}: ${value}`).join('; ')
         };
-        const conflicts = [];
-        let currentEquipment = '';
-        for (const msg of session.messages) for (const line of String(msg.text || '').split('\n')) {
-          const equipmentMatch = line.match(/^Equipamento:\s*(.+)$/i);
-          if (equipmentMatch) currentEquipment = equipmentMatch[1].trim();
-          if (!line.startsWith('DIVERGENCIA_MEDICAO: ')) continue;
-          try {
-            const conflict = JSON.parse(line.slice('DIVERGENCIA_MEDICAO: '.length));
-            if ((history.equipmentIdentity(currentEquipment) === equipmentKey || checkedRecords.length === 1) &&
-                !conflicts.some(item => foldText(item.field) === foldText(conflict.field))) conflicts.push(conflict);
-          } catch {}
+        let conflicts = [];
+        for (const msg of session.messages) {
+          const text = String(msg.text || '');
+          if (!text.includes('Conteúdo lido do anexo:')) continue;
+          for (const rawSection of text.slice(text.indexOf('Conteúdo lido do anexo:') + 'Conteúdo lido do anexo:'.length).split(/--- OUTRO EQUIPAMENTO ---/i)) {
+            const section = rawSection.trim();
+            if (!section) continue;
+            let currentEquipment = section.match(/^\s*Equipamento:\s*(.+)$/im)?.[1]?.trim() || '';
+            if (!(history.equipmentIdentity(currentEquipment) === equipmentKey || (!currentEquipment && checkedRecords.length === 1))) continue;
+            const currentConflicts = [];
+            for (const rawLine of section.split('\n')) {
+              const line = rawLine.trim();
+              const equipmentMatch = line.match(/^Equipamento:\s*(.+)$/i);
+              if (equipmentMatch) currentEquipment = equipmentMatch[1].trim();
+              if (!line.startsWith('DIVERGENCIA_MEDICAO: ')) continue;
+              try {
+                const conflict = JSON.parse(line.slice('DIVERGENCIA_MEDICAO: '.length));
+                if ((history.equipmentIdentity(currentEquipment) === equipmentKey || checkedRecords.length === 1) &&
+                    !currentConflicts.some(item => foldText(item.field) === foldText(conflict.field))) currentConflicts.push(conflict);
+              } catch {}
+            }
+            const validatedFields = new Set(section.split('\n').flatMap(line => {
+              const match = line.match(/^\s*([^:]+):\s*([+-]?\d+(?:[.,]\d+)?)\s*(?:mm|cm|µm|μm|um|mil|mils|in|pol)\s*\(fonte:/i);
+              return match ? [foldText(match[1])] : [];
+            }));
+            conflicts = conflicts.filter(item => !validatedFields.has(foldText(item.field)) &&
+              !currentConflicts.some(next => foldText(next.field) === foldText(item.field)));
+            conflicts.push(...currentConflicts);
+          }
         }
         for (const conflict of conflicts) {
           const key = fieldKeys[foldText(conflict.field)];
@@ -416,30 +434,43 @@ async function handleConfirmation(sock, msg, text, quotedId) {
   if (!confirmation) return false;
 
   const [key, entry] = confirmation;
+  console.log('Resposta de conferência recebida:', groupJid, entry.sessionId, messageId);
   const reply = async text => {
     try { await sock.sendMessage(groupJid, { text, quoted: msg }); } catch {}
   };
   if (!isAuthorizedForConfirmation(msg, entry)) {
+    console.log('Resposta rejeitada: remetente não autorizado', groupJid, entry.sessionId);
     await reply(authorizedApprovers.length
       ? 'Somente uma pessoa autorizada pode responder a esta conferência.'
       : 'Somente a pessoa que solicitou esta conferência pode respondê-la. Se necessário, marque o bot para iniciar outra solicitação.');
     return true;
   }
   if (entry.status === 'superseded') {
+    console.log('Resposta rejeitada: proposta substituída', groupJid, entry.sessionId);
     await reply('Responda à última mensagem de conferência do bot. Esta versão foi substituída.');
     return true;
   }
   if (entry.status === 'answered') {
+    console.log('Resposta rejeitada: proposta já respondida', groupJid, entry.sessionId);
     await reply('Esta conferência já foi validada e gravada na planilha. Marque o bot novamente para iniciar uma nova conferência.');
     return true;
   }
   if (entry.createdAt && Date.now() - entry.createdAt > PROPOSAL_TTL_MS) {
+    console.log('Resposta rejeitada: proposta expirada', groupJid, entry.sessionId);
     await reply('Esta proposta de conferência expirou. Marque o bot novamente para gerar uma nova conferência.');
     return true;
   }
 
-  const corrections = parseCorrection(text, entry.conflicts || []);
+  const corrections = parseCorrection(text, entry.conflicts || [], entry.data || {});
   const approved = isApproval(text);
+  if (corrections.unknownFields?.length) {
+    await reply(`Campo não reconhecido: ${corrections.unknownFields.join(', ')}. Confira os nomes apresentados na conferência.`);
+    return true;
+  }
+  if (corrections.invalidFields?.length) {
+    await reply(`Informe um valor válido e a unidade para: ${corrections.invalidFields.join(', ')}.`);
+    return true;
+  }
   if (!corrections.length && !approved) {
     if (/\b(?:axial|radial)\s+(?:vertical|horizontal)\s*[:=]?\s*[+-]?\d/i.test(text)) {
       await reply('Informe a unidade da medição (ex.: “Axial Vertical: -0,01 mm”).');
@@ -463,6 +494,7 @@ async function handleConfirmation(sock, msg, text, quotedId) {
   }
 
   try {
+    console.log('Resposta aceita para processamento:', groupJid, sessionId, corrections.length ? 'correção' : 'confirmação');
     if (corrections.length) {
       const schema = await history.getRecordSchema(sheets, spreadsheetId);
       const allowed = new Set(schema.flatMap(column => column.mappedAs || []));
@@ -516,7 +548,7 @@ async function handleConfirmation(sock, msg, text, quotedId) {
     await reply(result.row ? `Dados validados e gravados na linha ${result.row} da planilha.`
       : 'Dados validados e gravados na planilha.');
   } catch (error) {
-    console.error('Falha ao processar confirmação de alinhamento.', error.code || error.status || '');
+    console.error('Falha ao processar confirmação de alinhamento.', error.message, error.code || error.status || '');
     appendPending({ groupJid, messageId, sessionId, reason: 'falha ao processar confirmação' });
     await reply('Não consegui concluir a confirmação com o Google Sheets. Responda novamente à mensagem de conferência para tentar de novo.');
   }
@@ -543,6 +575,19 @@ async function handleMessageInternal(sock, msg, options = {}) {
 
     if (contextInfo.stanzaId && await serializeConfirmations(groupJid, () =>
       handleConfirmation(sock, msg, text, contextInfo.stanzaId))) return;
+
+    if (!attachment && !options.replay && !contextInfo.stanzaId) {
+      const handled = await serializeConfirmations(groupJid, async () => {
+        const open = confirmations.latestOpen?.(groupJid) || [];
+        if (!open.length) return false;
+        const correction = parseCorrection(text, open.length === 1 ? open[0].conflicts || [] : [], open.length === 1 ? open[0].data || {} : {});
+        if (!isApproval(text) && !correction.length && !correction.invalidFields?.length) return false;
+        if (open.length === 1) return handleConfirmation(sock, msg, text, open[0].messageId);
+        await sock.sendMessage(groupJid, {text:'Há mais de uma conferência aberta. Use “Responder” na conferência específica.', quoted:msg});
+        return true;
+      });
+      if (handled) return;
+    }
 
     const mentioned = explicitlyMentionsBot(sock, content);
     const activeSession = alignmentTracker?.snapshot?.()[groupJid];
@@ -658,6 +703,11 @@ async function handleMessageInternal(sock, msg, options = {}) {
       saveSeenIds();
     }
     if (outcome !== 'ignorada') console.log('Coleta de alinhamento:', outcome, groupJid);
+    if (attachment && !options.replay && outcome !== 'ignorada' && confirmations.latestOpen?.(groupJid).length) {
+      Promise.resolve().then(() => alignmentTracker.tick?.(groupJid)).catch((error) => {
+        console.error('Falha ao reanalisar anexo na sessão:', error.message);
+      });
+    }
     return;
   }
 

@@ -64,4 +64,27 @@ test('relatório com quatro geradores gera propostas sem gravar antes da valida�
 
   await onExtract(session, 'sincronização periódica', {records}, [{text}]);
   assert.equal(writes.length,0);
+
+  const oldPhoto = 'Conteúdo lido do anexo: Equipamento: MCP 1\nDIVERGENCIA_MEDICAO: {"field":"Axial Vertical","caption":"-0.015 mm","visual":"-0.01 mm"}';
+  const newPhoto = 'Conteúdo lido do anexo: Equipamento: MCP 1\nAxial Vertical: -0.01 mm (fonte: tela -0.01 mm)';
+  const latest = {group:'group@g.us',startedAt:session.startedAt,messages:[{text:oldPhoto},{text:newPhoto}]};
+  const record = {status:'incomplete',vessel:{value:'BRAM Atlas',message:1,quote:'BRAM Atlas'},equipment:{value:'MCP 1',message:2,quote:'Equipamento: MCP 1'},fields:{axial_vertical:{value:'-0.01 mm',message:2,quote:'-0.01 mm'}}};
+  await onExtract(latest,'teste',{records:[record]},[{text:'BRAM Atlas'}, {text:newPhoto}]);
+  assert.equal(proposals.at(-1).proposal.conflicts.length,0);
+  assert.equal(proposals.at(-1).proposal.data.axial_vertical,'-0.01 mm');
+
+  const multiFirst = 'Conteúdo lido do anexo: Equipamento: Diesel Generator #1\nDIVERGENCIA_MEDICAO: {"field":"Axial Vertical","caption":"-0.1 mm","visual":"-0.01 mm"}\n\n--- OUTRO EQUIPAMENTO ---\n\nEquipamento: Diesel Generator #2\nRadial Vertical: 0.02 mm (fonte: tela 0.02 mm)';
+  const multiFixed = 'Conteúdo lido do anexo: Equipamento: Diesel Generator #1\nAxial Vertical: -0.01 mm (fonte: tela -0.01 mm)';
+  const multiRecords = [
+    {status:'incomplete',vessel:{value:'BRAM Atlas',message:1,quote:'BRAM Atlas'},equipment:{value:'Diesel Generator #1',message:1,quote:'Diesel Generator #1'},fields:{}},
+    {status:'incomplete',vessel:{value:'BRAM Atlas',message:1,quote:'BRAM Atlas'},equipment:{value:'Diesel Generator #2',message:1,quote:'Diesel Generator #2'},fields:{radial_vertical:{value:'0.02 mm',message:1,quote:'0.02 mm'}}}
+  ];
+  await onExtract({group:'group-m@g.us',startedAt:'2026-11-22T10:00:00Z',messages:[{text:multiFirst}]},'teste',{records:multiRecords},[{text:'BRAM Atlas\n' + multiFirst}]);
+  const dg1Conflict = proposals.findLast(p => p.group === 'group-m@g.us' && p.proposal.data.equipment === 'Diesel Generator #1');
+  assert.equal(dg1Conflict.proposal.conflicts.length, 1);
+  assert.equal(dg1Conflict.proposal.data.axial_vertical, 'usuário passou informação divergente');
+  await onExtract({group:'group-m@g.us',startedAt:'2026-11-22T10:00:01Z',messages:[{text:multiFirst},{text:multiFixed}]},'teste',{records:[{...multiRecords[0],fields:{axial_vertical:{value:'-0.01 mm',message:2,quote:'-0.01 mm'}}}]},[{text:multiFirst},{text:'BRAM Atlas\n' + multiFixed}]);
+  const dg1Fixed = proposals.findLast(p => p.group === 'group-m@g.us' && p.proposal.data.equipment === 'Diesel Generator #1');
+  assert.equal(dg1Fixed.proposal.conflicts.length, 0);
+  assert.equal(dg1Fixed.proposal.data.axial_vertical, '-0.01 mm');
 });
