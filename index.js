@@ -195,56 +195,158 @@ function cacheBeforeMention(group, msg) {
   preMentionMessages.set(group, messages.slice(-60));
 }
 
-async function publishReview(sock, group, sessionId, proposal) {
-  const { data, conflicts } = proposal;
+const REQUIRED_ALIGNMENT_FIELDS = [
+  { key: 'date', label: 'Data' },
+  { key: 'motivation', label: 'Motivação' },
+  { key: 'executor', label: 'Executor' },
+  { key: 'method', label: 'Método' },
+  { key: 'axial_vertical', label: 'Axial Vertical' },
+  { key: 'axial_horizontal', label: 'Axial Horizontal' },
+  { key: 'radial_vertical', label: 'Radial Vertical' },
+  { key: 'radial_horizontal', label: 'Radial Horizontal' },
+  { key: 'coupling_gap', label: 'Coupling GAP' }
+];
+
+function stripMentions(text) {
+  return String(text || '')
+    .split('\n')
+    .map(line => line.replace(/(?:^|\s)@\S+/g, ' ').replace(/[ \t]+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+function getMissingRequiredFields(effectiveData, conflicts = []) {
+  const conflictLabels = new Set(conflicts.map(c => foldText(c.field)));
+  return REQUIRED_ALIGNMENT_FIELDS.filter(({ key, label }) => {
+    const val = effectiveData[key];
+    return !history.isKnown(val) ||
+      foldText(val) === 'usuario passou informacao divergente' ||
+      conflictLabels.has(foldText(label));
+  });
+}
+
+async function publishReview(sock, group, sessionId, proposal, options = {}) {
+  const { data, conflicts = [] } = proposal;
   const { target: resolved, status, schema } = await history.resolveRecordTarget(sheets, spreadsheetId, data, sessionId);
   const lostExistingRow = proposal.requireExisting && !resolved?.row;
   const target = lostExistingRow ? null : resolved;
-  const displayLines = schema.filter(column => column.mappedAs?.length).flatMap(column =>
-    column.mappedAs.map(key => {
-      const repeated = schema.filter(item => item.title === column.title && item.mappedAs?.length).length > 1;
-      const title = repeated ? `${column.title} (${column.group})` : column.title;
-      const value = key === 'comments'
-        ? [history.userComments(target?.current.comments), data.observations].filter(Boolean).join(' | ')
-        : data[key];
-      const previous = target?.current[key];
-      const changedExisting = key !== 'comments' && history.isKnown(value) && history.isKnown(previous) && foldText(value) !== foldText(previous);
-      const shown = history.isKnown(value)
-        ? (changedExisting ? `${value} (anterior: ${previous})` : value)
-        : history.isKnown(previous) ? `${previous} (mantido)` : 'não informado';
-      return `${title}: ${shown}`;
-    })
-  );
-  if (data.observations && !schema.some(column => column.mappedAs?.includes('comments'))) {
-    displayLines.push(`Observações: ${data.observations}`);
+
+  const conflictKeys = new Set(conflicts.map(c => foldText(c.field)));
+  const fieldKeyByLabel = {
+    'axial vertical': 'axial_vertical',
+    'axial horizontal': 'axial_horizontal',
+    'radial vertical': 'radial_vertical',
+    'radial horizontal': 'radial_horizontal',
+    'coupling gap': 'coupling_gap'
+  };
+  const dataToWrite = { ...data };
+  for (const conflict of conflicts) {
+    const k = fieldKeyByLabel[foldText(conflict.field)];
+    if (k) delete dataToWrite[k];
   }
-  const destination = target?.row ? `Destino: linha ${target.row} já existente.`
-    : target ? 'Destino: nova linha para este equipamento.'
-    : lostExistingRow ? 'A linha existente deixou de ser identificável. Confira a embarcação, o equipamento e a data antes de prosseguir.'
-    : status === 'too_recent' ? 'A última gravação de equipamento nesta embarcação foi há menos de duas horas. Depois desse intervalo, marque o bot para uma nova conferência.'
-    : status === 'identity_missing' ? 'Informe a embarcação e o equipamento para identificar a linha.'
-    : 'A linha ainda não foi identificada com segurança. Confira a embarcação, o equipamento e a data completa.';
-  const text = [
-    'Confira todos os dados do alinhamento antes de gravar na planilha:',
-    destination,
-    ...displayLines,
-    proposal.attachmentPending ? 'A leitura do anexo falhou ou ficou incompleta; os dados da legenda precisam ser conferidos.' : '',
-    ...conflicts.map(conflict => `Divergência ${conflict.field}: legenda ${conflict.caption || 'não informada'}; imagem ${conflict.visual || 'não legível'}.`),
-    conflicts.length ? 'Escolha o valor correto de cada divergência informando o campo e o valor antes de confirmar.' : '',
-    target ? 'Responda diretamente com “confirmo” para validar todos os dados acima.' : '',
-    'Para corrigir ou completar algum dado, responda no formato “Campo: valor”. O bot enviará todos os dados para nova confirmação.'
-  ].filter(Boolean).join('\n');
-  const prompt = confirmations.prepare(group, sessionId, { ...proposal, target: target ?? null, text });
+
+  let writeResult = null;
+  let nextTarget = target;
+  const mergedCurrent = { ...(target?.current || {}) };
+  for (const [k, v] of Object.entries(dataToWrite)) {
+    if (history.isKnown(v)) mergedCurrent[k] = v;
+  }
+
+  if (target) {
+    const writeId = options.confirmationId || crypto.createHash('sha256')
+      .update(JSON.stringify({ sessionId, dataToWrite, row: target.row })).digest('hex').slice(0, 16);
+    writeResult = await history.recordHistory(sheets, spreadsheetId, {
+      ...dataToWrite,
+      groupJid: group,
+      approvedBy: options.senderId || proposal.authorizedSender || ''
+    }, sessionId, { target, confirmationId: writeId });
+
+    if (!['appended', 'updated', 'unchanged'].includes(writeResult.status)) {
+      appendPending({ groupJid: group, sessionId, reason: writeResult.status });
+      if (!sock) return false;
+      try {
+        await sock.sendMessage(group, { text: 'A planilha mudou durante a gravação. Reenvie ou mencione o bot para tentar novamente.' });
+      } catch {}
+      return false;
+    }
+
+    const row = writeResult.row || target.row;
+    try {
+      const refreshed = await history.resolveRecordTarget(sheets, spreadsheetId, {
+        ...mergedCurrent,
+        vessel: mergedCurrent.vessel || data.vessel,
+        equipment: mergedCurrent.equipment || data.equipment
+      }, sessionId);
+      nextTarget = refreshed.target || { ...target, row, current: mergedCurrent };
+    } catch {
+      nextTarget = { ...target, row, current: mergedCurrent };
+    }
+    if (nextTarget?.current) {
+      for (const [k, v] of Object.entries(nextTarget.current)) {
+        if (history.isKnown(v)) mergedCurrent[k] = v;
+      }
+    }
+    console.log('Gravação verificada:', group, sessionId, row || 'linha desconhecida');
+  }
+
+  const missing = getMissingRequiredFields(mergedCurrent, conflicts);
+  const row = writeResult?.row || nextTarget?.row;
+  const identityLabel = [mergedCurrent.vessel || data.vessel, mergedCurrent.equipment || data.equipment]
+    .filter(v => history.isKnown(v)).join(' — ');
+
+  let text;
+  if (!target) {
+    const destination = lostExistingRow
+      ? 'A linha existente deixou de ser identificável. Informe a embarcação, o equipamento e a data.'
+      : status === 'identity_missing'
+        ? 'Não consegui identificar a linha ainda. Informe a embarcação e o equipamento (ex.: “Vessel: Joe Griffin” e “Equipment / Tag: MCP”).'
+        : 'A linha ainda não foi identificada com segurança. Informe a embarcação, o equipamento e a data completa.';
+    text = [
+      destination,
+      missing.length ? 'Campos obrigatórios ainda pendentes:\n' + missing.map(f => `- ${f.label}`).join('\n') : '',
+      'Responda esta mensagem ou mencione o bot com os dados no formato “Campo: valor”.'
+    ].filter(Boolean).join('\n');
+  } else if (missing.length === 0 && conflicts.length === 0) {
+    const header = writeResult.status === 'appended'
+      ? `Dados gravados na nova linha ${row} da planilha${identityLabel ? ` (${identityLabel})` : ''}.`
+      : `Dados atualizados na linha ${row} da planilha${identityLabel ? ` (${identityLabel})` : ''}.`;
+    text = `${header}\nTodos os campos obrigatórios foram preenchidos!`;
+  } else {
+    const header = writeResult.status === 'appended'
+      ? `Dados recebidos gravados na nova linha ${row} da planilha${identityLabel ? ` (${identityLabel})` : ''}.`
+      : writeResult.status === 'updated'
+        ? `Dados atualizados na linha ${row} da planilha${identityLabel ? ` (${identityLabel})` : ''}.`
+        : `Linha ${row} conferida${identityLabel ? ` (${identityLabel})` : ''}.`;
+    text = [
+      header,
+      proposal.attachmentPending ? 'A leitura do anexo falhou ou ficou incompleta; os dados da legenda foram gravados.' : '',
+      ...conflicts.map(c => `Divergência em ${c.field}: legenda ${c.caption || 'não informada'}; imagem ${c.visual || 'não legível'}.`),
+      missing.length ? `Ainda faltam estas informações para completar a linha ${row}:\n` + missing.map(f => `- ${f.label}`).join('\n') : '',
+      'Responda esta mensagem ou mencione o bot informando o que falta (ex.: “Executor: Navship” ou “Coupling GAP: 25 mm”). Vou preencher automaticamente na mesma linha.'
+    ].filter(Boolean).join('\n');
+  }
+
+  const prompt = confirmations.prepare(group, sessionId, {
+    ...proposal,
+    data: mergedCurrent,
+    conflicts,
+    target: nextTarget ?? null,
+    requireExisting: Boolean(row),
+    text
+  });
   if (!prompt) return true;
   if (!sock) return false;
   try {
     const sent = await sock.sendMessage(group, { text: prompt.text });
     if (!sent?.key?.id) throw new Error('Mensagem sem identificador');
     confirmations.sent(prompt.key, sent.key.id);
-    console.log('Conferência enviada:', group, sessionId, sent.key.id);
+    if (target && missing.length === 0 && conflicts.length === 0) {
+      confirmations.done(prompt.key, sent.key.id, 'answered', options.senderId || '');
+    }
+    console.log('Atualização enviada:', group, sessionId, sent.key.id);
     return true;
   } catch {
-    appendPending({groupJid:group, sessionId, reason:'proposta pendente: confirmação não enviada'});
+    appendPending({ groupJid: group, sessionId, reason: 'notificação não enviada após gravação' });
     return false;
   }
 }
@@ -461,96 +563,58 @@ async function handleConfirmation(sock, msg, text, quotedId) {
     return true;
   }
 
-  const corrections = parseCorrection(text, entry.conflicts || [], entry.data || {});
-  const approved = isApproval(text);
+  const cleanText = stripMentions(text);
+  const corrections = parseCorrection(cleanText, entry.conflicts || [], entry.data || {});
   if (corrections.unknownFields?.length) {
-    await reply(`Campo não reconhecido: ${corrections.unknownFields.join(', ')}. Confira os nomes apresentados na conferência.`);
+    await reply(`Campo não reconhecido: ${corrections.unknownFields.join(', ')}. Use os nomes dos campos solicitados.`);
     return true;
   }
   if (corrections.invalidFields?.length) {
     await reply(`Informe um valor válido e a unidade para: ${corrections.invalidFields.join(', ')}.`);
     return true;
   }
-  if (!corrections.length && !approved) {
-    if (/\b(?:axial|radial)\s+(?:vertical|horizontal)\s*[:=]?\s*[+-]?\d/i.test(text)) {
+  if (!corrections.length) {
+    if (/\b(?:axial|radial)\s+(?:vertical|horizontal)\s*[:=]?\s*[+-]?\d/i.test(cleanText)) {
       await reply('Informe a unidade da medição (ex.: “Axial Vertical: -0,01 mm”).');
-    } else {
-      await reply('Responda “confirmo” para validar todos os dados ou indique as correções no formato “Campo: valor”.');
+      return true;
     }
-    return true;
+    return false;
   }
 
   const data = { ...entry.data };
   const sessionId = entry.sessionId;
   const approverId = [msg.key.participant, msg.key.participantAlt].map(jidDigits).find(Boolean) || '';
-  const makeReview = (conflicts = entry.conflicts || []) => publishReview(sock, groupJid, sessionId, {
-    data, conflicts, sourceVersion: entry.sourceVersion, startedAt: entry.startedAt, parentKey: key,
-    authorizedSender: entry.authorizedSender, attachmentPending: entry.attachmentPending,
-    requireExisting: Boolean(entry.target?.row || entry.requireExisting) && history.sameEquipment(data, entry.data)
-  });
   if (!sessionId) {
-    await reply('Esta proposta antiga não pode ser validada. Marque o bot para gerar uma nova conferência.');
+    await reply('Esta sessão antiga não pode ser atualizada. Marque o bot para iniciar outra.');
     return true;
   }
 
   try {
-    console.log('Resposta aceita para processamento:', groupJid, sessionId, corrections.length ? 'correção' : 'confirmação');
-    if (corrections.length) {
-      const schema = await history.getRecordSchema(sheets, spreadsheetId);
-      const allowed = new Set(schema.flatMap(column => column.mappedAs || []));
-      if (corrections.some(({ key }) => !allowed.has(key === 'observations' ? 'comments' : key))) {
-        await reply('Uma das correções aponta para um campo sem coluna reconhecida. Confira os nomes apresentados na proposta.');
-        return true;
-      }
-      for (const { key, value } of corrections) data[key] = value;
-      const conflicts = (entry.conflicts || []).filter(conflict =>
-        !corrections.some(change => change.key === parseCorrection(`${conflict.field}: 0 mm`)[0]?.key)
-      );
-      if (await makeReview(conflicts)) {
-        if (messageId) { markSeen(groupJid, messageId); saveSeenIds(); }
-      } else {
-        await reply('Não consegui enviar a proposta corrigida. Responda novamente com as correções para tentar de novo.');
-      }
+    console.log('Atualização incremental recebida:', groupJid, sessionId, corrections.map(c => c.key).join(','));
+    const schema = await history.getRecordSchema(sheets, spreadsheetId);
+    const allowed = new Set(schema.flatMap(column => column.mappedAs || []));
+    if (corrections.some(({ key }) => !allowed.has(key === 'observations' ? 'comments' : key))) {
+      await reply('Um dos campos informados não tem coluna reconhecida na planilha.');
       return true;
     }
-
-    if ((entry.conflicts || []).length) {
-      await reply('Ainda há divergências. Informe o campo e o valor escolhido para receber uma nova conferência.');
-      return true;
+    for (const { key, value } of corrections) data[key] = value;
+    const conflicts = (entry.conflicts || []).filter(conflict =>
+      !corrections.some(change => change.key === parseCorrection(`${conflict.field}: 0 mm`)[0]?.key)
+    );
+    const saved = await publishReview(sock, groupJid, sessionId, {
+      data, conflicts, sourceVersion: entry.sourceVersion, startedAt: entry.startedAt, parentKey: key,
+      authorizedSender: entry.authorizedSender, attachmentPending: entry.attachmentPending,
+      requireExisting: Boolean(entry.target?.row || entry.requireExisting) && history.sameEquipment(data, entry.data)
+    }, { senderId: approverId, confirmationId: key });
+    if (saved) {
+      if (messageId) { markSeen(groupJid, messageId); saveSeenIds(); }
+    } else {
+      await reply('Não consegui gravar a atualização agora. Reenvie os dados para tentar novamente.');
     }
-    if (!entry.target) {
-      if (entry.target === null) {
-        await reply('Ainda preciso identificar o destino. Confira os dados solicitados na mensagem de conferência.');
-      } else {
-        await makeReview();
-      }
-      return true;
-    }
-
-    const conflictNotes = (entry.conflicts || []).map(item =>
-      `${item.field}: legenda ${item.caption || 'não informada'}; imagem ${item.visual || 'não legível'}`
-    ).join('; ');
-    const result = await history.recordHistory(sheets, spreadsheetId, {
-      ...data,
-      observations: [data.observations, conflictNotes].filter(Boolean).join('; '),
-      groupJid,
-      approvedBy: approverId
-    }, sessionId, { target: entry.target, confirmationId: key });
-    if (!['appended', 'updated', 'unchanged'].includes(result.status)) {
-      appendPending({ groupJid, messageId, sessionId, reason: result.status });
-      await reply('A planilha mudou ou o destino ficou indefinido. Confira os dados na nova proposta para liberar a gravação.');
-      if (!await makeReview()) await reply('Não consegui enviar a nova conferência. Tente confirmar novamente.');
-      return true;
-    }
-    confirmations.done(key, messageId, 'answered', approverId);
-    console.log('Gravação verificada:', groupJid, sessionId, result.row || 'linha desconhecida');
-    if (messageId) { markSeen(groupJid, messageId); saveSeenIds(); }
-    await reply(result.row ? `Dados validados e gravados na linha ${result.row} da planilha.`
-      : 'Dados validados e gravados na planilha.');
   } catch (error) {
-    console.error('Falha ao processar confirmação de alinhamento.', error.message, error.code || error.status || '');
-    appendPending({ groupJid, messageId, sessionId, reason: 'falha ao processar confirmação' });
-    await reply('Não consegui concluir a confirmação com o Google Sheets. Responda novamente à mensagem de conferência para tentar de novo.');
+    console.error('Falha ao atualizar alinhamento na planilha.', error.message, error.code || error.status || '');
+    appendPending({ groupJid, messageId, sessionId, reason: 'falha ao gravar atualização incremental' });
+    await reply('Não consegui concluir a gravação no Google Sheets. Reenvie os dados para tentar novamente.');
   }
   return true;
 }
@@ -580,10 +644,11 @@ async function handleMessageInternal(sock, msg, options = {}) {
       const handled = await serializeConfirmations(groupJid, async () => {
         const open = confirmations.latestOpen?.(groupJid) || [];
         if (!open.length) return false;
-        const correction = parseCorrection(text, open.length === 1 ? open[0].conflicts || [] : [], open.length === 1 ? open[0].data || {} : {});
-        if (!isApproval(text) && !correction.length && !correction.invalidFields?.length) return false;
+        const cleanText = stripMentions(text);
+        const correction = parseCorrection(cleanText, open.length === 1 ? open[0].conflicts || [] : [], open.length === 1 ? open[0].data || {} : {});
+        if (!correction.length && !correction.invalidFields?.length) return false;
         if (open.length === 1) return handleConfirmation(sock, msg, text, open[0].messageId);
-        await sock.sendMessage(groupJid, {text:'Há mais de uma conferência aberta. Use “Responder” na conferência específica.', quoted:msg});
+        await sock.sendMessage(groupJid, {text:'Há mais de um alinhamento em aberto. Use “Responder” na mensagem do equipamento específico.', quoted:msg});
         return true;
       });
       if (handled) return;
@@ -703,9 +768,9 @@ async function handleMessageInternal(sock, msg, options = {}) {
       saveSeenIds();
     }
     if (outcome !== 'ignorada') console.log('Coleta de alinhamento:', outcome, groupJid);
-    if (attachment && !options.replay && outcome !== 'ignorada' && confirmations.latestOpen?.(groupJid).length) {
-      Promise.resolve().then(() => alignmentTracker.tick?.(groupJid)).catch((error) => {
-        console.error('Falha ao reanalisar anexo na sessão:', error.message);
+    if ((!options.replay || options.explicitMention) && outcome !== 'ignorada' && typeof alignmentTracker?.tick === 'function') {
+      await alignmentTracker.tick(groupJid).catch((error) => {
+        console.error('Falha ao sincronizar sessão imediatamente:', error.message);
       });
     }
     return;

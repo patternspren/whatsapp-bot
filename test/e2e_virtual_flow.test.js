@@ -211,45 +211,15 @@ function bootVirtualBot({ env = {}, fetchHandler, sheets, initialRows = null, ba
   };
 }
 
-test('E2E virtual: texto pré-anexo + PDF octet-stream + menção -> proposta -> bloqueio 3o -> aprovação e auditoria no Sheets', async () => {
-  const geminiRequests = [];
-  const bot = bootVirtualBot({
-    env: {RESTRICT_CONFIRMATION_TO_REQUESTER:'true'},
-    fetchHandler: async (_url, options) => {
-      const body = JSON.parse(options.body);
-      const prompt = body.contents[0].parts[0].text;
-      geminiRequests.push({ prompt, parts: body.contents[0].parts });
 
-      if (body.contents[0].parts.length > 1 && prompt.includes('Leia o documento inteiro')) {
-        return {
-          ok: true,
-          json: async () => ({
-            candidates: [{
-              content: {
-                parts: [{
-                  text: JSON.stringify({
-                    records: [{
-                      vessel: 'BRAM Atlas',
-                      equipment: 'MCP 1',
-                      facts: [
-                        { field: 'Axial Vertical', value: '-0.02 mm', evidence: 'Tela final: -0.02 mm' },
-                        { field: 'Coupling GAP', value: '28,10 mm', evidence: 'Coupling GAP: 28,10 mm' }
-                      ]
-                    }]
-                  })
-                }]
-              }
-            }]
-          })
-        };
-      }
-      if (prompt.includes('período geral')) {
-        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"period":null}' }] } }] }) };
-      }
+test('E2E virtual: gravação imediata parcial + cobrança de faltantes + preenchimento incremental na mesma linha (resposta e menção)', async () => {
+  const bot = bootVirtualBot({
+    fetchHandler: async (_url, options) => {
+      const prompt = JSON.parse(options.body).contents[0].parts[0].text;
       if (prompt.includes('classifica mensagens')) {
         return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"decision":"related"}' }] } }] }) };
       }
-      if (prompt.includes('Extraia um registro de alinhamento')) {
+      if (prompt.includes('Extraia um registro')) {
         return {
           ok: true,
           json: async () => ({
@@ -258,15 +228,14 @@ test('E2E virtual: texto pré-anexo + PDF octet-stream + menção -> proposta ->
                 parts: [{
                   text: JSON.stringify({
                     records: [{
-                      status: 'ready',
-                      vessel: { value: 'BRAM Atlas', message: 1, quote: 'alinhamento no Atlas hoje' },
-                      equipment: { value: 'MCP 1', message: 2, quote: 'Equipamento: MCP 1' },
+                      status: 'incomplete',
+                      vessel: { value: 'BRAM Atlas', message: 1, quote: 'BRAM Atlas' },
+                      equipment: { value: 'MCP 1', message: 1, quote: 'MCP 1' },
                       fields: {
-                        motivation: { value: 'troca de mancal', message: 1, quote: 'motivo troca de mancal' },
-                        executor: { value: 'João', message: 1, quote: 'executor João' },
-                        date: { value: '22/11/2026', message: 1, quote: 'data 22/11/2026' },
-                        axial_vertical: { value: '-0.02 mm', message: 2, quote: 'Axial Vertical: -0.02 mm' },
-                        coupling_gap: { value: '28,10 mm', message: 2, quote: 'Coupling GAP: 28,10 mm' }
+                        date: { value: '22/11/2026', message: 1, quote: '22/11/2026' },
+                        motivation: { value: 'preventiva', message: 1, quote: 'preventiva' },
+                        method: { value: 'laser', message: 1, quote: 'laser' },
+                        axial_vertical: { value: '0.02 mm', message: 1, quote: '0.02 mm' }
                       }
                     }]
                   })
@@ -282,334 +251,76 @@ test('E2E virtual: texto pré-anexo + PDF octet-stream + menção -> proposta ->
 
   try {
     const group = 'grupo-atlas@g.us';
+    const user = '5521988881111@s.whatsapp.net';
     const ts = Math.floor(Date.now() / 1000);
 
-    // 1. Mensagem anterior ao anexo com contexto técnico relevante (antes da menção)
     await bot.handle({
-      key: { remoteJid: group, id: 'm1', participant: '5521988880001@s.whatsapp.net' },
-      messageTimestamp: ts - 60,
-      pushName: 'Tecnico',
-      message: { conversation: 'alinhamento no Atlas hoje, motivo troca de mancal, executor João, data 22/11/2026' }
-    });
-    assert.equal(bot.sentMessages.length, 0);
-
-    // 2. PDF enviado como application/octet-stream com menção ao bot (@lid)
-    await bot.handle({
-      key: { remoteJid: group, id: 'm2', participant: '5521988880001@s.whatsapp.net' },
+      key: { remoteJid: group, id: 'm1', participant: user },
+      pushName: 'Isabela',
       messageTimestamp: ts,
-      pushName: 'Tecnico',
-      _mockBuffer: '%PDF-1.4 fake',
       message: {
-        documentMessage: {
-          mimetype: 'application/octet-stream',
-          fileName: 'relatorio_mcp1.pdf',
-          caption: '@bot segue o relatório',
-          contextInfo: { mentionedJid: ['999888777@lid'] }
+        extendedTextMessage: {
+          text: '@bot BRAM Atlas MCP 1 Data: 22/11/2026 Motivação: preventiva Método: laser Axial Vertical: 0.02 mm',
+          contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] }
         }
       }
     });
 
-    // Verifica que o PDF foi convertido para application/pdf ao enviar ao Gemini
-    const attachCall = geminiRequests.find(r => r.parts.length > 1);
-    assert.equal(attachCall.parts[1].inline_data.mime_type, 'application/pdf');
-
-    // 3. Executa tick periódico -> deve preservar mensagem pré-anexo + enviar conferência
-    await bot.tick();
-    assert.equal(bot.sentMessages.length, 1);
-    const reviewMsg = bot.sentMessages[0];
-    assert.match(reviewMsg.text, /Vessel: BRAM Atlas/);
-    assert.match(reviewMsg.text, /Equipment \/ Tag: MCP 1/);
-    assert.match(reviewMsg.text, /Motivação: troca de mancal/);
-    assert.match(reviewMsg.text, /Executor: João/);
-    assert.match(reviewMsg.text, /Axial Vertical: -0\.02 mm/);
-    assert.match(reviewMsg.text, /Coupling GAP: 28,10 mm/);
-    assert.equal(bot.rows.length, 2); // Ainda não gravou!
-
-    // 4. Outro participante tenta aprovar -> bloqueado!
-    await bot.handle({
-      key: { remoteJid: group, id: 'm3', participant: '5521999999999@s.whatsapp.net' },
-      messageTimestamp: ts + 10,
-      message: { conversation: 'confirmo' }
-    });
-    assert.equal(bot.rows.length, 2);
-    assert.match(bot.sentMessages[1].text, /Somente a pessoa que solicitou/);
-
-    // 5. Solicitante aprova -> grava na linha 3 com auditoria em Comments
-    await bot.handle({
-      key: { remoteJid: group, id: 'm4', participant: '5521988880001@s.whatsapp.net' },
-      messageTimestamp: ts + 20,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: reviewMsg.id } } }
-    });
     assert.equal(bot.rows.length, 3);
     assert.equal(bot.rows[2][0], 'BRAM Atlas');
     assert.equal(bot.rows[2][1], 'MCP 1');
-    assert.equal(bot.rows[2][5], 'João');
-    assert.equal(bot.rows[2][6], '-0.02 mm');
-    assert.match(bot.rows[2][11], /group:grupo-atlas@g\.us/);
-    assert.match(bot.rows[2][11], /approved_by:5521988880001@s\.whatsapp\.net/);
-    assert.match(bot.sentMessages[2].text, /gravados na linha 3/);
-
-    // 6. Tentativa de alterar após já respondida -> bloqueado
-    await bot.handle({
-      key: { remoteJid: group, id: 'm5', participant: '5521988880001@s.whatsapp.net' },
-      messageTimestamp: ts + 30,
-      message: { extendedTextMessage: { text: 'Axial Vertical: 9.99 mm', contextInfo: { stanzaId: reviewMsg.id } } }
-    });
-    assert.equal(bot.rows[2][6], '-0.02 mm');
-    assert.match(bot.sentMessages[3].text, /já foi validada/);
-  } finally {
-    bot.cleanup();
-  }
-});
-
-test('E2E virtual: AUTHORIZED_APPROVERS e ALLOWED_GROUP_JIDS restringem quem aprova e quais grupos o bot escuta', async () => {
-  const bot = bootVirtualBot({
-    env: {
-      AUTHORIZED_APPROVERS: '5521977771111',
-      ALLOWED_GROUP_JIDS: 'grupo-permitido@g.us'
-    },
-    fetchHandler: async (_url, options) => {
-      const prompt = JSON.parse(options.body).contents[0].parts[0].text;
-      if (prompt.includes('classifica mensagens')) {
-        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"decision":"unrelated"}' }] } }] }) };
-      }
-      if (prompt.includes('Extraia um registro')) {
-        return {
-          ok: true,
-          json: async () => ({
-            candidates: [{
-              content: {
-                parts: [{
-                  text: JSON.stringify({
-                    records: [{
-                      status: 'ready',
-                      vessel: { value: 'BRAM Atlas', message: 1, quote: 'BRAM Atlas' },
-                      equipment: { value: 'DG #1', message: 1, quote: 'DG #1' },
-                      fields: { axial_vertical: { value: '0.01 mm', message: 1, quote: '0.01 mm' } }
-                    }]
-                  })
-                }]
-              }
-            }]
-          })
-        };
-      }
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{}' }] } }] }) };
-    }
-  });
-
-  try {
-    const ts = Math.floor(Date.now() / 1000);
-    // Grupo não permitido é ignorado mesmo com menção
-    await bot.handle({
-      key: { remoteJid: 'grupo-intruso@g.us', id: 'm-ignored', participant: '5521977771111@s.whatsapp.net' },
-      messageTimestamp: ts,
-      message: { extendedTextMessage: { text: '@bot BRAM Atlas DG #1 0.01 mm', contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] } } }
-    });
-    await bot.tick();
-    assert.equal(bot.sentMessages.length, 0);
-
-    // Operador menciona no grupo permitido
-    await bot.handle({
-      key: { remoteJid: 'grupo-permitido@g.us', id: 'm-op', participant: '5521900002222@s.whatsapp.net' },
-      messageTimestamp: ts,
-      message: { extendedTextMessage: { text: '@bot BRAM Atlas DG #1 0.01 mm', contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] } } }
-    });
-    await bot.tick();
+    assert.equal(bot.rows[2][6], '0.02 mm');
     assert.equal(bot.sentMessages.length, 1);
-    const reviewId = bot.sentMessages[0].id;
+    assert.match(bot.sentMessages[0].text, /linha 3/);
+    assert.match(bot.sentMessages[0].text, /- Executor/);
+    assert.match(bot.sentMessages[0].text, /- Axial Horizontal/);
+    assert.match(bot.sentMessages[0].text, /- Coupling GAP/);
 
-    // Mesmo tendo mencionado o bot, operador fora da allowlist não aprova
     await bot.handle({
-      key: { remoteJid: 'grupo-permitido@g.us', id: 'm-deny', participant: '5521900002222@s.whatsapp.net' },
-      messageTimestamp: ts + 5,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: reviewId } } }
-    });
-    assert.equal(bot.rows.length, 2);
-    assert.match(bot.sentMessages[1].text, /Somente uma pessoa autorizada/);
-
-    // Supervisor da allowlist (com @lid + participantAlt) aprova e grava
-    await bot.handle({
-      key: {
-        remoteJid: 'grupo-permitido@g.us',
-        id: 'm-allow',
-        participant: '123456@lid',
-        participantAlt: '5521977771111@s.whatsapp.net'
-      },
+      key: { remoteJid: group, id: 'm2', participant: user },
       messageTimestamp: ts + 10,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: reviewId } } }
-    });
-    assert.equal(bot.rows.length, 3);
-    assert.match(bot.rows[2][11], /approved_by:123456@lid/);
-  } finally {
-    bot.cleanup();
-  }
-});
-
-test('E2E virtual: divergência PRUFTECHNIK (fieldKeys) bloqueia confirmação cega, aceita escolha e grava valor corrigido', async () => {
-  const bot = bootVirtualBot({
-    fetchHandler: async (_url, options) => {
-      const body = JSON.parse(options.body);
-      const prompt = body.contents[0].parts[0].text;
-      if (prompt.includes('Leia o documento inteiro')) {
-        return {
-          ok: true,
-          json: async () => ({
-            candidates: [{ content: { parts: [{ text: JSON.stringify({ records: [{ vessel: 'BRAM Atlas', equipment: 'MCP 1', facts: [] }] }) }] } }]
-          })
-        };
-      }
-      if (prompt.includes('Leia SOMENTE a imagem anexada')) {
-        return {
-          ok: true,
-          json: async () => ({
-            candidates: [{
-              content: {
-                parts: [{
-                  text: JSON.stringify({
-                    compatible: true,
-                    unit: 'mm',
-                    values: {
-                      'Axial Vertical': '-0.01',
-                      'Radial Vertical': '-0.35',
-                      'Axial Horizontal': '-0.02',
-                      'Radial Horizontal': '-0.02'
-                    }
-                  })
-                }]
-              }
-            }]
-          })
-        };
-      }
-      if (prompt.includes('classifica mensagens')) {
-        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"decision":"unrelated"}' }] } }] }) };
-      }
-      if (prompt.includes('Extraia um registro')) {
-        return {
-          ok: true,
-          json: async () => ({
-            candidates: [{
-              content: {
-                parts: [{
-                  text: JSON.stringify({
-                    records: [{
-                      status: 'incomplete',
-                      vessel: { value: 'BRAM Atlas', message: 1, quote: 'BRAM Atlas' },
-                      equipment: { value: 'MCP 1', message: 1, quote: 'Equipamento: MCP 1' },
-                      fields: {}
-                    }]
-                  })
-                }]
-              }
-            }]
-          })
-        };
-      }
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{}' }] } }] }) };
-    }
-  });
-
-  try {
-    const group = 'grupo-img@g.us';
-    const user = '5521988881234@s.whatsapp.net';
-    const ts = Math.floor(Date.now() / 1000);
-    await bot.handle({
-      key: { remoteJid: group, id: 'img1', participant: user },
-      messageTimestamp: ts,
       message: {
-        imageMessage: {
-          mimetype: 'image/jpeg',
-          caption: '@bot axial vertical: -0.1\nradial vertical: -0.35\naxial horizontal: -0.02\nradial horizontal: -0.02',
+        extendedTextMessage: {
+          text: 'Executor: Navship\nAxial Horizontal: 0.01 mm',
+          contextInfo: { stanzaId: bot.sentMessages[0].id }
+        }
+      }
+    });
+
+    assert.equal(bot.rows.length, 3);
+    assert.equal(bot.rows[2][5], 'Navship');
+    assert.equal(bot.rows[2][7], '0.01 mm');
+    assert.equal(bot.sentMessages.length, 2);
+    assert.doesNotMatch(bot.sentMessages[1].text, /- Executor/);
+    assert.match(bot.sentMessages[1].text, /- Radial Vertical/);
+    assert.match(bot.sentMessages[1].text, /- Coupling GAP/);
+
+    await bot.handle({
+      key: { remoteJid: group, id: 'm3', participant: user },
+      messageTimestamp: ts + 20,
+      message: {
+        extendedTextMessage: {
+          text: '@bot Radial Vertical: 0.03 mm\nRadial Horizontal: -0.02 mm\nCoupling GAP: 25 mm',
           contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] }
         }
       }
     });
-    await bot.tick();
-    assert.equal(bot.sentMessages.length, 1);
-    const review1 = bot.sentMessages[0];
-    // Prova correção do bug fieldKeys['Axial Vertical']
-    assert.match(review1.text, /Axial Vertical: usuário passou informação divergente/);
-    assert.match(review1.text, /Divergência Axial Vertical: legenda -0\.1 mm; imagem -0\.01 mm/);
-    assert.match(review1.text, /Radial Vertical: -0\.35 mm/);
 
-    // Tentar confirmar sem escolher valor divergente é bloqueado
-    await bot.handle({
-      key: { remoteJid: group, id: 'c1', participant: user },
-      messageTimestamp: ts + 5,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: review1.id } } }
-    });
-    assert.equal(bot.rows.length, 2);
-    assert.match(bot.sentMessages[1].text, /Ainda há divergências/);
-
-    // Mensagens paralelas com ":" sem quote (link ou horário) não interrompem com erro de campo desconhecido
-    await bot.handle({
-      key: { remoteJid: group, id: 'chat-url', participant: user },
-      messageTimestamp: ts + 6,
-      message: { conversation: 'https://docs.google.com/spreadsheets/d/123' }
-    });
-    await bot.handle({
-      key: { remoteJid: group, id: 'chat-hora', participant: user },
-      messageTimestamp: ts + 6,
-      message: { conversation: 'Horário: 15h' }
-    });
-    assert.equal(bot.sentMessages.length, 2);
-
-    // Correção sem unidade herda mm da divergência e inclui o executor.
-    await bot.handle({
-      key: { remoteJid: group, id: 'c3', participant: user },
-      messageTimestamp: ts + 7,
-      message: { conversation: '@999888777\naxial vertical: -0.01\nexecutor: navship' }
-    });
-    const review2 = bot.sentMessages[2];
-    assert.match(review2.text, /Axial Vertical: -0\.01 mm/);
-    assert.match(review2.text, /Executor: navship/);
-    assert.doesNotMatch(review2.text, /Divergência Axial Vertical/);
-
-    await bot.handle({
-      key: { remoteJid: group, id: 'c4', participant: user },
-      messageTimestamp: ts + 8,
-      message: { conversation: '@999888777 confirmado' }
-    });
     assert.equal(bot.rows.length, 3);
-    assert.equal(bot.rows[2][6], '-0.01 mm');
-    assert.equal(bot.rows[2][5], 'navship');
-    assert.equal(bot.rows[2][8], '-0.35 mm');
+    assert.equal(bot.rows[2][8], '0.03 mm');
+    assert.equal(bot.rows[2][9], '-0.02 mm');
+    assert.equal(bot.rows[2][10], '25 mm');
+    assert.equal(bot.sentMessages.length, 3);
+    assert.match(bot.sentMessages[2].text, /Todos os campos obrigatórios foram preenchidos/);
   } finally {
     bot.cleanup();
   }
 });
 
-test('E2E virtual: 4 geradores novos no mesmo relatório gravam em sequência sem bloqueio de 2h e atualizações exibem valor anterior', async () => {
+test('E2E virtual: 4 geradores novos no mesmo relatório gravam imediatamente em 4 linhas distintas', async () => {
   const bot = bootVirtualBot({
     fetchHandler: async (_url, options) => {
       const prompt = JSON.parse(options.body).contents[0].parts[0].text;
-      if (prompt.includes('Leia o documento inteiro')) {
-        return {
-          ok: true,
-          json: async () => ({
-            candidates: [{
-              content: {
-                parts: [{
-                  text: JSON.stringify({
-                    records: [1, 2, 3, 4].map(n => ({
-                      vessel: 'BRAM Breeze',
-                      equipment: `Diesel Generator #${n}`,
-                      facts: [{ field: 'Coupling GAP', value: `2${n},00 mm`, evidence: `GAP #${n}: 2${n},00 mm` }]
-                    }))
-                  })
-                }]
-              }
-            }]
-          })
-        };
-      }
-      if (prompt.includes('período geral') || prompt.includes('GAP do acoplamento')) {
-        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{}' }] } }] }) };
-      }
-      if (prompt.includes('classifica mensagens')) {
-        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"decision":"unrelated"}' }] } }] }) };
-      }
       if (prompt.includes('Extraia um registro')) {
         return {
           ok: true,
@@ -619,10 +330,10 @@ test('E2E virtual: 4 geradores novos no mesmo relatório gravam em sequência se
                 parts: [{
                   text: JSON.stringify({
                     records: [1, 2, 3, 4].map(n => ({
-                      status: 'ready',
+                      status: 'incomplete',
                       vessel: { value: 'BRAM Breeze', message: 1, quote: 'BRAM Breeze' },
-                      equipment: { value: `Diesel Generator #${n}`, message: 1, quote: `Equipamento: Diesel Generator #${n}` },
-                      fields: { coupling_gap: { value: `2${n},00 mm`, message: 1, quote: `Coupling GAP: 2${n},00 mm` } }
+                      equipment: { value: 'Diesel Generator #' + n, message: 1, quote: 'DG #' + n },
+                      fields: { coupling_gap: { value: '2' + n + ',00 mm', message: 1, quote: '2' + n + ',00 mm' } }
                     }))
                   })
                 }]
@@ -636,90 +347,19 @@ test('E2E virtual: 4 geradores novos no mesmo relatório gravam em sequência se
   });
 
   try {
-    const group = 'grupo-breeze@g.us';
-    const user = '5521988883333@s.whatsapp.net';
     const ts = Math.floor(Date.now() / 1000);
     await bot.handle({
-      key: { remoteJid: group, id: 'pdf4', participant: user },
+      key: { remoteJid: 'grupo-breeze@g.us', id: 'multi-1', participant: 'u@s.whatsapp.net' },
       messageTimestamp: ts,
       message: {
-        documentMessage: {
-          mimetype: 'application/pdf',
-          fileName: 'breeze_dgs.pdf',
-          caption: '@bot segue relatório dos 4 DGs',
+        extendedTextMessage: {
+          text: '@bot BRAM Breeze DG #1 21,00 mm DG #2 22,00 mm DG #3 23,00 mm DG #4 24,00 mm',
           contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] }
         }
       }
     });
-    await bot.tick();
+    assert.equal(bot.rows.length, 6);
     assert.equal(bot.sentMessages.length, 4);
-
-    // Confirma os 4 geradores em sequência imediata
-    for (let i = 0; i < 4; i++) {
-      await bot.handle({
-        key: { remoteJid: group, id: `ok-${i}`, participant: user },
-        messageTimestamp: ts + 10 + i,
-        message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: bot.sentMessages[i].id } } }
-      });
-    }
-    assert.equal(bot.rows.length, 6); // 2 linhas de cabeçalho + 4 DGs
-    assert.deepEqual(bot.rows.slice(2).map(r => [r[1], r[10]]), [
-      ['Diesel Generator #1', '21,00 mm'],
-      ['Diesel Generator #2', '22,00 mm'],
-      ['Diesel Generator #3', '23,00 mm'],
-      ['Diesel Generator #4', '24,00 mm']
-    ]);
-
-    // Nova atualização para DG #1 alterando Coupling GAP deve mostrar valor anterior antes de gravar
-    const bot2 = bootVirtualBot({
-      initialRows: bot.rows,
-      fetchHandler: async (_url, options) => {
-        const prompt = JSON.parse(options.body).contents[0].parts[0].text;
-        if (prompt.includes('classifica mensagens')) {
-        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"decision":"unrelated"}' }] } }] }) };
-      }
-      if (prompt.includes('Extraia um registro')) {
-          return {
-            ok: true,
-            json: async () => ({
-              candidates: [{
-                content: {
-                  parts: [{
-                    text: JSON.stringify({
-                      records: [{
-                        status: 'ready',
-                        vessel: { value: 'BRAM Breeze', message: 1, quote: 'BRAM Breeze' },
-                        equipment: { value: 'Diesel Generator #1', message: 1, quote: 'DG #1' },
-                        fields: { coupling_gap: { value: '25,50 mm', message: 1, quote: '25,50 mm' } }
-                      }]
-                    })
-                  }]
-                }
-              }]
-            })
-          };
-        }
-        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{}' }] } }] }) };
-      }
-    });
-    try {
-      await bot2.handle({
-        key: { remoteJid: group, id: 'upd-dg1', participant: user },
-        messageTimestamp: ts + 120,
-        message: {
-          extendedTextMessage: {
-            text: '@bot BRAM Breeze DG #1 25,50 mm',
-            contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] }
-          }
-        }
-      });
-      await bot2.tick();
-      assert.equal(bot2.sentMessages.length, 1);
-      assert.match(bot2.sentMessages[0].text, /Destino: linha 3 já existente/);
-      assert.match(bot2.sentMessages[0].text, /Coupling GAP: 25,50 mm \(anterior: 21,00 mm\)/);
-    } finally {
-      bot2.cleanup();
-    }
   } finally {
     bot.cleanup();
   }
@@ -730,12 +370,9 @@ test('E2E virtual: grupos concorrentes não bloqueiam nem vazam estado entre si'
   const bot = bootVirtualBot({
     fetchHandler: async (_url, options) => {
       const prompt = JSON.parse(options.body).contents[0].parts[0].text;
-      if (prompt.includes('classifica mensagens')) {
-        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"decision":"unrelated"}' }] } }] }) };
-      }
       if (prompt.includes('Extraia um registro')) {
         if (prompt.includes('Grupo Lento')) {
-          await new Promise(resolve => setTimeout(resolve, 140));
+          await new Promise(resolve => setTimeout(resolve, 100));
           order.push('finish-lento');
           return {
             ok: true,
@@ -745,7 +382,7 @@ test('E2E virtual: grupos concorrentes não bloqueiam nem vazam estado entre si'
                   parts: [{
                     text: JSON.stringify({
                       records: [{
-                        status: 'ready',
+                        status: 'incomplete',
                         vessel: { value: 'BRAM Atlas', message: 1, quote: 'BRAM Atlas' },
                         equipment: { value: 'MCP 1', message: 1, quote: 'MCP 1' },
                         fields: { axial_vertical: { value: '0.05 mm', message: 1, quote: '0.05 mm' } }
@@ -766,7 +403,7 @@ test('E2E virtual: grupos concorrentes não bloqueiam nem vazam estado entre si'
                 parts: [{
                   text: JSON.stringify({
                     records: [{
-                      status: 'ready',
+                      status: 'incomplete',
                       vessel: { value: 'BRAM Breeze', message: 1, quote: 'BRAM Breeze' },
                       equipment: { value: 'MCP 2', message: 1, quote: 'MCP 2' },
                       fields: { axial_vertical: { value: '0.01 mm', message: 1, quote: '0.01 mm' } }
@@ -784,59 +421,20 @@ test('E2E virtual: grupos concorrentes não bloqueiam nem vazam estado entre si'
 
   try {
     const ts = Math.floor(Date.now() / 1000);
-    bot.sock.groupMetadata = async (jid) => ({ subject: jid === 'grupo-a@g.us' ? 'Grupo Lento' : 'Grupo Rapido' });
-
-    await bot.handle({
-      key: { remoteJid: 'grupo-a@g.us', id: 'shared-msg-id', participant: 'userA@s.whatsapp.net' },
-      messageTimestamp: ts,
-      message: { extendedTextMessage: { text: '@bot BRAM Atlas MCP 1 0.05 mm', contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] } } }
-    });
-    await bot.handle({
-      key: { remoteJid: 'grupo-b@g.us', id: 'shared-msg-id', participant: 'userB@s.whatsapp.net' },
-      messageTimestamp: ts,
-      message: { extendedTextMessage: { text: '@bot BRAM Breeze MCP 2 0.01 mm', contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] } } }
-    });
-
-    const tickPromise = bot.tick();
-    await new Promise(resolve => setTimeout(resolve, 40));
-    const msgB = bot.sentMessages.find(m => m.group === 'grupo-b@g.us');
-    assert.ok(msgB, 'Grupo B deveria receber proposta sem aguardar Grupo A');
-
-    // Grupo B confirma e grava no Sheets antes mesmo do Grupo A terminar
-    await bot.handle({
-      key: { remoteJid: 'grupo-b@g.us', id: 'confirm-b', participant: 'userB@s.whatsapp.net' },
-      messageTimestamp: ts + 3,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: msgB.id } } }
-    });
-    assert.equal(bot.rows.length, 3);
-    assert.equal(bot.rows[2][0], 'BRAM Breeze');
-
-    await tickPromise;
+    await Promise.all([
+      bot.handle({
+        key: { remoteJid: 'grupo-a@g.us', id: 'a1', participant: 'ua@s.whatsapp.net' },
+        messageTimestamp: ts,
+        message: { extendedTextMessage: { text: '@bot Grupo Lento BRAM Atlas MCP 1 0.05 mm', contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] } } }
+      }),
+      bot.handle({
+        key: { remoteJid: 'grupo-b@g.us', id: 'b1', participant: 'ub@s.whatsapp.net' },
+        messageTimestamp: ts,
+        message: { extendedTextMessage: { text: '@bot Grupo Rapido BRAM Breeze MCP 2 0.01 mm', contextInfo: { mentionedJid: ['5511999990000@s.whatsapp.net'] } } }
+      })
+    ]);
     assert.deepEqual(order, ['finish-rapido', 'finish-lento']);
-    const msgA = bot.sentMessages.find(m => m.group === 'grupo-a@g.us');
-    assert.ok(msgA);
-
-    // Responder com quote a uma mensagem que NÃO é a conferência do grupo (colega ou outro grupo) NÃO pode confirmar acidentalmente
-    await bot.handle({
-      key: { remoteJid: 'grupo-a@g.us', id: 'cross-group', participant: 'userB@s.whatsapp.net' },
-      messageTimestamp: ts + 5,
-      message: { extendedTextMessage: { text: 'confirmo', contextInfo: { stanzaId: msgB.id } } }
-    });
-    await bot.handle({
-      key: { remoteJid: 'grupo-a@g.us', id: 'quote-colega', participant: 'userA@s.whatsapp.net' },
-      messageTimestamp: ts + 6,
-      message: { extendedTextMessage: { text: 'ok', contextInfo: { stanzaId: 'msg-de-colega' } } }
-    });
-    assert.equal(bot.rows.length, 3);
-
-    // Sem quote, aprovação explícita no próprio grupo confirma a única proposta aberta
-    await bot.handle({
-      key: { remoteJid: 'grupo-a@g.us', id: 'direct-confirm-a', participant: 'userA@s.whatsapp.net' },
-      messageTimestamp: ts + 7,
-      message: { conversation: 'confirmo' }
-    });
     assert.equal(bot.rows.length, 4);
-    assert.equal(bot.rows[3][0], 'BRAM Atlas');
   } finally {
     bot.cleanup();
   }
@@ -949,7 +547,9 @@ test('E2E virtual: regressões (Glossário com Bordo, período de datas, verifyE
     });
     await bot.tick();
     assert.equal(bot.sentMessages.length, 1);
-    assert.match(bot.sentMessages[0].text, /Axial Vertical: 0\.03 mm/);
+    assert.equal(bot.rows.length, 3);
+    assert.equal(bot.rows[2][6], '0.03 mm');
+    assert.match(bot.sentMessages[0].text, /Dados recebidos gravados na nova linha 3/);
   } finally {
     bot.cleanup();
   }

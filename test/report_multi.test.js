@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const extraction = require('../gemini_conversation');
 const history = require('../alignment_history');
 
-test('relatório com quatro geradores gera propostas sem gravar antes da validação', async () => {
+test('relatório com quatro geradores grava imediatamente e cobra campos faltantes', async () => {
   let onExtract;
   const writes = [];
   const proposals = [];
@@ -52,18 +52,18 @@ test('relatório com quatro geradores gera propostas sem gravar antes da valida�
 
   assert.equal(outcome.proposed, 4);
   assert.equal(outcome.pending, 0);
-  assert.equal(writes.length, 0);
+  assert.equal(writes.length, 4);
   assert.equal(proposals.length, 4);
   assert.equal(new Set(proposals.map(row => row.sessionId)).size, 4);
   assert.deepEqual(proposals.map(row => row.proposal.data.equipment),
     ['Diesel Generator #1', 'Diesel Generator #2', 'Diesel Generator #3', 'Diesel Generator #4']);
   assert.equal(proposals[2].proposal.data.coupling_gap, '31,00 mm');
-  assert.match(proposals[0].proposal.text,/Axial Vertical: não informado/);
-  assert.match(proposals[0].proposal.text,/Maker \(Drive Machine\): não informado/);
-  assert.match(proposals[0].proposal.text,/Maker \(Máquina Estacionária\): não informado/);
+  assert.match(proposals[0].proposal.text,/Ainda faltam estas informações/);
+  assert.match(proposals[0].proposal.text,/- Axial Vertical/);
+  assert.match(proposals[0].proposal.text,/- Coupling GAP/);
 
   await onExtract(session, 'sincronização periódica', {records}, [{text}]);
-  assert.equal(writes.length,0);
+  assert.equal(writes.length, 8);
 
   const oldPhoto = 'Conteúdo lido do anexo: Equipamento: MCP 1\nDIVERGENCIA_MEDICAO: {"field":"Axial Vertical","caption":"-0.015 mm","visual":"-0.01 mm"}';
   const newPhoto = 'Conteúdo lido do anexo: Equipamento: MCP 1\nAxial Vertical: -0.01 mm (fonte: tela -0.01 mm)';
@@ -82,7 +82,8 @@ test('relatório com quatro geradores gera propostas sem gravar antes da valida�
   await onExtract({group:'group-m@g.us',startedAt:'2026-11-22T10:00:00Z',messages:[{text:multiFirst}]},'teste',{records:multiRecords},[{text:'BRAM Atlas\n' + multiFirst}]);
   const dg1Conflict = proposals.findLast(p => p.group === 'group-m@g.us' && p.proposal.data.equipment === 'Diesel Generator #1');
   assert.equal(dg1Conflict.proposal.conflicts.length, 1);
-  assert.equal(dg1Conflict.proposal.data.axial_vertical, 'usuário passou informação divergente');
+  assert.equal(dg1Conflict.proposal.data.axial_vertical, undefined);
+  assert.match(dg1Conflict.proposal.text, /Divergência em Axial Vertical/);
   await onExtract({group:'group-m@g.us',startedAt:'2026-11-22T10:00:01Z',messages:[{text:multiFirst},{text:multiFixed}]},'teste',{records:[{...multiRecords[0],fields:{axial_vertical:{value:'-0.01 mm',message:2,quote:'-0.01 mm'}}}]},[{text:multiFirst},{text:'BRAM Atlas\n' + multiFixed}]);
   const dg1Fixed = proposals.findLast(p => p.group === 'group-m@g.us' && p.proposal.data.equipment === 'Diesel Generator #1');
   assert.equal(dg1Fixed.proposal.conflicts.length, 0);

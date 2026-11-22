@@ -52,40 +52,59 @@ const proposal=()=>({status:'sent',authorizedSender:'isabela@s.whatsapp.net',ses
 },conflicts:[{field:'Axial Vertical',caption:'-0.015 mm',visual:'-0.01 mm'}]});
 const reply=(text,stanzaId='proposal',id='response')=>({key:{remoteJid:'grupo@g.us',participant:'isabela@s.whatsapp.net',id},message:{extendedTextMessage:{text,contextInfo:{stanzaId}}}});
 
-test('divergência exige escolha explícita antes de gravar',async()=>{
-  const h=harness(proposal());
-  await h.handle(h.sock,reply('confirmo'));
-  assert.equal(h.writes.length,0);
-  assert.match(h.replies[0].text,/divergências/);
-  assert.equal(h.replies.length,1);
-});
-
-test('correção pede nova validação completa e só depois grava na mesma linha',async()=>{
+test('atualização por resposta grava imediatamente na mesma linha e cobra campos faltantes',async()=>{
   const h=harness(proposal());
   await h.handle(h.sock,reply('Axial Vertical: -0,01 mm'));
-  assert.equal(h.writes.length,0);
-  assert.match(h.replies[0].text,/Vessel: BRAM Atlas/);
-  assert.match(h.replies[0].text,/Equipment \/ Tag: MCP 1/);
-  assert.match(h.replies[0].text,/Axial Vertical: -0.01 mm/);
-  await h.handle(h.sock,reply('confirmo','bot-reply','response-2'));
   assert.equal(h.writes.length,1);
   assert.equal(h.writes[0].data.axial_vertical,'-0.01 mm');
-  assert.equal(h.writes[0].data.observations,'');
   assert.equal(h.writes[0].sessionId,'same-session');
   assert.equal(h.writes[0].options.target.row,3);
+  assert.match(h.replies[0].text,/linha 3/);
+  assert.match(h.replies[0].text,/Ainda faltam estas informações/);
+  assert.match(h.replies[0].text,/- Executor/);
+  assert.match(h.replies[0].text,/- Coupling GAP/);
+  assert.equal(h.completed.length,0);
 });
 
-test('destino alterado exige nova conferência e não confirma gravação',async()=>{
+test('preencher todos os campos obrigatórios encerra a cobrança na mesma linha',async()=>{
+  const fullEntry={
+    ...proposal(),
+    conflicts:[],
+    data:{
+      vessel:'BRAM Atlas',equipment:'MCP 1',date:'22/11/2026',motivation:'preventiva',
+      method:'laser',axial_vertical:'-0.01 mm',axial_horizontal:'0.02 mm',
+      radial_vertical:'0.01 mm',radial_horizontal:'-0.02 mm',coupling_gap:'25 mm'
+    }
+  };
+  const schema=[
+    {title:'Vessel',mappedAs:['vessel']}, {title:'Equipment / Tag',mappedAs:['equipment']},
+    {title:'Executor',mappedAs:['executor']}
+  ];
+  const h=harness(fullEntry);
+  // Usa campo permitido no schema padrão (axial_vertical) completando o último faltante
+  const entryAlmostDone={
+    ...fullEntry,
+    data:{...fullEntry.data,executor:'Navship',axial_vertical:''}
+  };
+  const h2=harness(entryAlmostDone);
+  await h2.handle(h2.sock,reply('Axial Vertical: -0,01 mm'));
+  assert.equal(h2.writes.length,1);
+  assert.equal(h2.writes[0].options.target.row,3);
+  assert.match(h2.replies[0].text,/Todos os campos obrigatórios foram preenchidos/);
+  assert.equal(h2.completed.length,1);
+  assert.ok(schema.length > 0 && h);
+});
+
+test('destino alterado avisa o grupo e não confirma gravação',async()=>{
   const h=harness({...proposal(),conflicts:[]}, {status:'target_changed'});
-  await h.handle(h.sock,reply('confirmo'));
+  await h.handle(h.sock,reply('Axial Vertical: -0,01 mm'));
   assert.equal(h.completed.length,0);
   assert.match(h.replies[0].text,/planilha mudou/);
-  assert.match(h.replies[1].text,/linha 3 já existente/);
 });
 
-test('outra pessoa pode confirmar a proposta por padrão',async()=>{
+test('outra pessoa pode completar os dados por padrão',async()=>{
   const h=harness({...proposal(),conflicts:[]});
-  const msg=reply('confirmo'); msg.key.participant='outra@s.whatsapp.net';
+  const msg=reply('Axial Vertical: -0,01 mm'); msg.key.participant='outra@s.whatsapp.net';
   await h.handle(h.sock,msg);
   assert.equal(h.writes.length,1);
   assert.equal(h.writes[0].data.approvedBy,'outra@s.whatsapp.net');
