@@ -1,73 +1,44 @@
 ---
 trigger: always_on
-description: "Regra de coordenação e delegação entre os custom agents diagnosticador, integracoes e qa-testes no repositório patternspren/whatsapp-bot."
+description: "Regra de coordenação e delegação entre Coordenador, diagnosticador, integracoes e qa-testes no repositório patternspren/whatsapp-bot."
 ---
 
-# Coordenação da Equipe de Custom Agents (`patternspren/whatsapp-bot`)
+# Coordenação da Equipe — `patternspren/whatsapp-bot`
 
-Esta regra define como o agente coordenador deve delegar tarefas entre os três Custom Agents do repositório (`.agents/agents/`) e quais limites de segurança e governança são invioláveis.
+Esta regra organiza a equipe em **4 funções claras e sem redundância**, seguindo também as diretrizes compartilhadas de `@AGENTS.md`:
 
-## Visão Geral da Equipe
-
-| Agente | Modelo | Modo / Política | Especialidade Principal | Pode Editar Código? |
+| Função | Quem assume no Antigravity | Modelo / Modo | Papel principal | Pode editar código? |
 | :--- | :--- | :--- | :--- | :--- |
-| `diagnosticador` | `pro` | Somente leitura (`off`) | Análise de causa raiz (RCA), debugging e mapeamento de falhas | **Não** |
-| `integracoes` | `pro` | Investigação + aprovação (`off`) | Node.js, Baileys, Gemini API, Google Sheets e Google Cloud | **Somente após aprovação explícita do usuário** |
-| `qa-testes` | `flash` | Sandbox (`sandbox`) | Testes `node:test`, regressão, mocks offline, race conditions e evidências | **Apenas arquivos em `test/`** |
+| **Coordenador** | Agente principal padrão | Modelo ativo | Entende o pedido, organiza a ordem, delega, reúne evidências e traduz tudo em linguagem simples | Coordena e documenta; respeita aprovações |
+| **Investigação** | `diagnosticador` | `pro` / `off` | Reproduz lógicas no código, identifica causa raiz (RCA) e separa fatos de hipóteses | **Não (somente leitura)** |
+| **Desenvolvimento e integrações** | `integracoes` | `pro` / `off` | Desenvolve melhorias Node.js e cuida de Baileys, Gemini API, Google Sheets e GCP | **Somente após aprovação explícita do usuário** |
+| **Qualidade e testes** | `qa-testes` | `flash` / `sandbox` | Prepara testes `node:test`, mocks offline, testes de race condition e entrega evidências | **Apenas arquivos em `test/`** |
 
 ---
 
-## Matriz de Decisão: Quando Delegar Cada Tarefa
+## Quando Delegar Cada Tarefa
 
-### 1. Delegar para `diagnosticador`
-Acione `diagnosticador` sempre que a demanda exigir entendimento profundo sem risco de alteração no workspace:
-- Investigar um bug, erro em runtime, exceção ou comportamento inesperado no bot (extração, confirmação, seleção de linha, menção, reconexão).
-- Realizar análise de causa raiz (RCA) entre múltiplos módulos (`index.js`, `gemini_conversation.js`, `alignment_config.js`, `alignment_history.js`, `alignment_measurements.js`, `confirmations.js`).
-- Mapear onde uma condição de corrida, perda de estado ou regressão pode ocorrer antes de propor qualquer mudança.
-- Auditar lógica de negócios ou fluxo de dados em modo estritamente somente leitura.
-
-### 2. Delegar para `integracoes`
-Acione `integracoes` quando a tarefa envolver contratos externos, protocolos, bibliotecas de integração ou infraestrutura GCP:
-- Falhas ou melhorias envolvendo **Baileys / WhatsApp** (`makeWASocket`, `useMultiFileAuthState`, `DisconnectReason`, `downloadMediaMessage`, menções, citações, anexos).
-- Ajustes de **Gemini API** (`geminiJson`, timeout de `AbortController`, retries, `GEMINI_MODEL`, leitura de anexos e PDFs multi-gerador).
-- Ajustes ou investigação em **Google Sheets API** (`loadAlignmentConfig`, `getRecordSchema`, `resolveRecordTarget`, `recordHistory`, `batchUpdate`, `append`, Application Default Credentials).
-- Diagnóstico e propostas para **Node.js / Google Cloud / CI-CD** (`docs/ci-cd-setup.md`, `.github/workflows/ci-deploy.yml`, `scripts/deploy-vm.sh`).
-- **Exigência obrigatória**: o `integracoes` deve sempre investigar primeiro, apresentar a proposta (arquivos, diff resumido, riscos, rollback e plano de testes) e **obter aprovação explícita do usuário** antes de modificar qualquer código de produção.
-
-### 3. Delegar para `qa-testes`
-Acione `qa-testes` quando for necessário provar comportamento, prevenir regressões ou testar concorrência:
-- Criar ou atualizar testes automatizados em `test/*.test.js` usando `node:test` e `node:assert/strict`.
-- Construir ou ampliar mocks offline (`node:vm`, fakes de Google Sheets, fakes de Gemini/Baileys, diretórios temporários) mantendo `npm test` 100% determinístico e sem chamadas externas.
-- Escrever testes para condições de corrida (`serializeConfirmations`, concorrência entre tick de 5 minutos e mensagens/confirmações, duplicidade de `seenIds`, mudança de destino na planilha).
-- Executar a suíte de testes e entregar relatório objetivo de evidências (cenários cobertos, arquivos alterados, comando rodado e contagens reais).
+- **Para `diagnosticador`**: sempre que houver falha, comportamento estranho, dúvida sobre fluxo interno ou necessidade de mapear riscos antes de mexer no código. Deve conferir a lógica real no código e testes (ignorando docs legados `SUPPORT.md` e `GITHUB-SETUP.md`).
+- **Para `integracoes`**: sempre que for necessário ajustar ou evoluir código Node.js, Baileys, Gemini API, Google Sheets ou pipeline GCP/CI-CD. O agente investiga primeiro, explica em linguagem simples, apresenta proposta + riscos + rollback e **pede aprovação do usuário** antes de editar.
+- **Para `qa-testes`**: sempre que for preciso criar/ampliar testes offline em `test/`, simular condições de corrida ou provar com `node --test` que uma mudança não quebrou nada. Nunca usar grupos reais de WhatsApp nem planilhas de produção.
+- **Sobre o subagente nativo `browser`**: este bot é Node.js headless (sem frontend web). Não use `browser` para testar lógica do bot; ele só faz sentido se o usuário pedir verificação visual em uma interface web (por exemplo, documentação ou console autorizado) e nunca deve contornar logins ou CAPTCHAs.
 
 ---
 
-## Fluxos Recomendados de Handoff
+## Fluxos Recomendados e Passagem de Contexto (Handoff)
 
-1. **Bug ou incidente reportado**:
-   - `diagnosticador` (RCA somente leitura com evidências no código) ->
-   - `integracoes` (valida impacto na integração, propõe correção e pede aprovação ao usuário -> implementa após aceite) ->
-   - `qa-testes` (cria teste de regressão/concorrência e apresenta evidências com `npm test`).
-2. **Melhoria ou ajuste em integração externa (WhatsApp, Gemini, Sheets, GCP)**:
-   - `integracoes` (investiga contrato atual, propõe mudança e solicita aprovação -> implementa após aceite) ->
-   - `qa-testes` (adiciona mocks de sucesso, falha, timeout e retry + valida suíte completa).
-3. **Blindagem de confiabilidade / investigação de race condition**:
-   - `diagnosticador` (identifica pontos de concorrência e estados críticos) ->
-   - `qa-testes` (reproduz o cenário de forma determinística em `test/` e reporta evidências; se confirmar bug em produção, escala de volta para `integracoes` propor a correção ao usuário).
-4. **Regras de delegação e paralelismo**:
-   - Informe sempre no prompt do subagente o objetivo exato, os arquivos envolvidos e o critério de conclusão esperado.
-   - Investigações somente leitura (`diagnosticador`) podem rodar em paralelo (`workspace: "inherit"`), mas **nunca** execute dois agentes editando os mesmos arquivos simultaneamente.
+1. **Investigar e corrigir falha**: `diagnosticador` (RCA somente leitura) -> `integracoes` (propõe correção + pede aprovação do usuário -> aplica após aceite) -> `qa-testes` (testes de regressão/concorrência + evidências com `node --test`).
+2. **Nova melhoria ou ajuste de integração**: `integracoes` (analisa código/docs -> propõe + pede aprovação -> implementa) -> `qa-testes` (cobre cenários positivos, falhas e timeouts offline).
+3. **Blindagem com testes**: `diagnosticador` (mapeia cenários críticos) -> `qa-testes` (cria testes isolados em `test/` e valida; se achar bug em produção, devolve para `integracoes` propor a correção).
+4. **Como delegar**: ao chamar qualquer subagente, informe no prompt o **objetivo**, os **arquivos relevantes**, as **restrições (sem credenciais/sem editar produção)** e o **critério de conclusão**. Investigações somente leitura podem rodar em paralelo (`workspace: "inherit"`); nunca rode dois agentes editando o mesmo arquivo.
+5. **Continuidade entre ferramentas**: ao encerrar uma etapa relevante, o Coordenador consolida o bloco padrão **Resumo de Continuidade (Handoff)** definido em `@AGENTS.md` (branch, commit, evidências, hipóteses pendentes e próximo passo) para que o usuário possa continuar no Codex, ChatGPT ou GitHub pelo iPad.
 
 ---
 
-## Guardrails Invioláveis do Repositório
+## Gatilhos Obrigatórios de Decisão do Usuário e Guardrails
 
-Todos os agentes e o coordenador devem cumprir estas restrições sem exceção:
-
-1. **Nunca modificar a lógica do bot sem aprovação explícita** do usuário.
-2. **Nunca acessar, ler, imprimir ou versionar credenciais ou estado operacional**:
-   - Proibido ler `.env`, `credentials.json`, `*.service-account.json`, `auth_info_baileys/`, `alignment-sessions.json`, `alignment-confirmations.json`, `pending-alignment.jsonl`, `processed-message-ids.json`, `failed-attachments/`, `feedbacks.json`, `messages-responsable.json` e `disabled_users.json`.
-3. **Nunca alterar a branch `master` diretamente**: todo trabalho deve ocorrer em uma branch separada.
-4. **Nunca executar deploy** (`scripts/deploy-vm.sh`, `gcloud`, `systemctl` ou reinício da VM `alinhamento-bot`).
-5. **Nunca fazer `git push` nem abrir Pull Request** sem aprovação explícita do usuário.
+Sempre pare e peça decisão/aprovação explícita do usuário antes de:
+- Alterar código de produção ou regras de negócio.
+- Criar testes ou validações que dependam de ambiente externo real (WhatsApp, Gemini real, Google Sheets real).
+- Alterar a branch `master`, fazer `git push`, abrir/aprovar Pull Request ou executar deploy (`scripts/deploy-vm.sh`, `gcloud`, `systemctl`).
+- Jamais leia, exiba ou versione `.env`, `credentials.json`, `*.service-account.json`, `auth_info_baileys/`, `alignment-*.json`, `pending-alignment.jsonl`, `processed-message-ids.json`, `failed-attachments/`, `feedbacks.json`, `messages-responsable.json` ou `disabled_users.json`.
