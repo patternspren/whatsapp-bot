@@ -9,7 +9,7 @@ const heads = [
 function fakeSheet(...records) {
   const rows = [...heads, ...records];
   const writes = [];
-  const sheets = { spreadsheets: { values: {
+  const sheets = { spreadsheets: { get: async () => ({data:{sheets:[{properties:{title:'Modelo alinhamento'}}]}}), values: {
     get: async () => ({ data: { values: rows } }),
     batchUpdate: async ({ requestBody }) => {
       writes.push({ type: 'update', ranges: requestBody.data.map(item => item.range) });
@@ -49,7 +49,7 @@ test('linha da embarcação sem identificação do equipamento impede destino au
 
 test('atualiza a linha existente do mesmo equipamento mesmo depois de várias horas', async () => {
   const h = fakeSheet(['BRAM Atlas', 'DG 1', 'WEG', '18/11/2026', '0.3 mm', 'Nota anterior', '=1+2']);
-  const data = { vessel:'BRAM Atlas', equipment:'Diesel Generator #1', axial_vertical:'-0.01 mm', observations:'Unidade em mm' };
+  const data = { vessel:'BRAM Atlas', equipment:'Diesel Generator #1', date:'18/11/2026', axial_vertical:'-0.01 mm', observations:'Unidade em mm' };
   const { target } = await h.find(data, 'nova-sessao');
   assert.equal(target.row, 3);
   assert.equal(target.current.maker, 'WEG');

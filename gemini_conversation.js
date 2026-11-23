@@ -248,7 +248,7 @@ async function geminiJson(apiKey, prompt, model = 'gemini-3.1-flash-lite', media
   throw lastError;
 }
 
-function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema = async () => ({}) }) {
+function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema = async () => ({}), getRecordTabs = async () => [] }) {
   const configContext = async () => JSON.stringify((typeof config === 'function' ? await config() : await config) || {});
   async function detect(message, context = []) {
     const result = await geminiJson(apiKey, [
@@ -361,12 +361,12 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
             }
           } else {
             for (const [title, item] of labeled) {
-              disagreements.push({ field: title, caption: `${item.raw} ${item.unit || 'mm'}`, visual: null });
+              disagreements.push({ field: title, caption: [item.raw, item.unit].filter(Boolean).join(' '), visual: null });
             }
           }
         } catch (error) {
           for (const [title, item] of labeled) {
-            disagreements.push({ field: title, caption: `${item.raw} ${item.unit || 'mm'}`, visual: null });
+            disagreements.push({ field: title, caption: [item.raw, item.unit].filter(Boolean).join(' '), visual: null });
           }
           console.warn('Validação da imagem indisponível:', error.message);
         }
@@ -510,6 +510,7 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
       'Cada valor não nulo precisa apontar para o número da mensagem e conter uma quote literal daquela mensagem que inclua o valor. Use incomplete quando faltarem campos. Use ambiguous somente para o registro cuja identidade ou associação for incerta. Não descarte outros equipamentos claros.',
       'Use status ready somente quando vessel, equipment e ao menos um campo de histórico estiverem claros. Use as grafias e unidades originais.',
       'MOTIVO DE FECHAMENTO: ' + reason,
+      'ABAS DISPONÍVEIS (contexto auxiliar; destino decidido pelo sistema): ' + JSON.stringify(await getRecordTabs()),
       'CONFIGURAÇÃO ONLINE (referência para identificar valores canônicos; nunca invente): ' + await configContext(),
       'CABEÇALHOS E GRUPOS DA PLANILHA: ' + JSON.stringify(await getRecordSchema()),
       'MENSAGENS: ' + JSON.stringify(transcript)
@@ -658,9 +659,19 @@ function verifyExtraction(result, transcript) {
     collectFrom(latestSections);
     if (matchingSections.length) collectFrom(matchingSections);
   }
+  // Não inventa unidade para valores extraídos inicialmente; a regra é a mesma da resposta incremental.
+  const explicitUnit = String(fields['Unidade das medições'] || '').match(/^(mm|cm|µm|μm|um|mils?|in|pol)$/i)?.[1];
+  const missingUnits = [];
+  for (const label of ['Axial vertical', 'Axial horizontal', 'Radial vertical', 'Radial horizontal']) {
+    const value = fields[label];
+    if (!value) continue;
+    if (/^[+-]?\d+(?:[.,]\d+)?\s*(?:mm|cm|µm|μm|um|mils?|in|pol)$/i.test(value)) continue;
+    if (explicitUnit && /^[+-]?\d+(?:[.,]\d+)?$/.test(value)) fields[label] = value.replace(',', '.') + ' ' + explicitUnit;
+    else { missingUnits.push(label); delete fields[label]; }
+  }
   const input = [`Vessel: ${vessel}`, `Equipment: ${equipment}`];
   for (const [label, value] of Object.entries(fields)) input.push(`${label}: ${value}`);
-  return { ok: true, text: input.join('\n'), vessel, equipment, fields };
+  return { ok: true, text: input.join('\n'), vessel, equipment, fields, missingUnits };
 }
 
 function verifyExtractions(result, transcript) {

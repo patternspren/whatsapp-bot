@@ -9,6 +9,7 @@ test('recebe PDF no grupo e entrega o conteúdo ao rastreador', async () => {
   let download = async () => Buffer.from('pdf');
   const gemini = { inspectAttachment: async input => { inspected = input; return 'DG1 resultado 0,02 mm'; } };
   const mocks = {
+    './alignment_tabs': require('../alignment_tabs'),
     '@whiskeysockets/baileys': { downloadMediaMessage: (...args) => download(...args) },
     'qrcode-terminal': {}, pino: () => ({}),
     googleapis: { google: { options() {}, auth: { GoogleAuth: class {} }, sheets: () => ({}) } },
