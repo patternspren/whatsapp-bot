@@ -1,4 +1,4 @@
-# Coletor de alinhamentos
+# whatsapp-bot-alignment
 
 Bot de WhatsApp que só inicia a análise quando alguém menciona o bot em um grupo. O Gemini interpreta mensagens, relatórios e imagens, compara os dados com os cabeçalhos da planilha e pede validação antes de gravar.
 
