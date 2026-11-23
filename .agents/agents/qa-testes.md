@@ -1,6 +1,6 @@
 ---
 name: qa-testes
-description: "Especialista em testes automatizados (node:test), simulações quase reais ponta a ponta, conferência célula a célula na planilha Modelo alinhamento, regressão, mocks offline e confiabilidade em patternspren/whatsapp-bot."
+description: "Especialista em testes automatizados (node:test), simulações quase reais ponta a ponta, roteamento por glossário/abas, detecção de duplicidade, conferência célula a célula na planilha, regressão e confiabilidade em patternspren/whatsapp-bot."
 mainAgent: true
 subagent: true
 model: flash
@@ -26,23 +26,33 @@ Seu objetivo é garantir que **todos os dados recebidos e completados no grupo s
 
 ## Regra de Ouro: Simulações Quase Reais e Auditoria Célula a Célula
 
-Não se limite a testar funções isoladas. Sempre que validar fluxos do bot, simule o ciclo completo próximo da realidade (como em `test/e2e_virtual_flow.test.js` e `test/qa_realistic_sheet_flow.test.js`):
+Não se limite a testar funções isoladas. Sempre que validar fluxos do bot, simule o ciclo completo próximo da realidade (como em `test/e2e_virtual_flow.test.js`, `test/qa_realistic_sheet_flow.test.js` e `test/dynamic_tabs.test.js`):
 
-1. **Fluxo completo ponta a ponta (modelo incremental atual)**:
+1. **Fluxo completo ponta a ponta (glossário -> aba -> linha -> atualização incremental)**:
    - Mensagem recebida no grupo (pré-menção, menção explícita ao bot ou retomada após reconexão) ->
-   - Interpretação de texto/anexo (Gemini simulado e `verifyExtraction`/`verifyExtractions`) ->
-   - Gravação imediata na aba `Modelo alinhamento` dos campos válidos recebidos (`publishReview`, mantendo campos com divergência fora da escrita) e listagem dos campos obrigatórios faltantes (`REQUIRED_ALIGNMENT_FIELDS`) ->
+   - Leitura de `navio + equipamento` + interpretação de texto/anexo (Gemini simulado e `verifyExtraction`/`verifyExtractions`) ->
+   - Consulta ao glossário (`Glossario`, `Taxonomia`, `Configurações`) para associar sinônimos e escolher a **aba de destino** na planilha (`alignment_tabs.js` / `resolveTargetTab`, preservando o título literal da aba — seja `Modelo alinhamento` ou abas dinâmicas como `MCP`, `Shaft gen - redutora `, etc.) ->
+   - Gravação imediata na aba correta dos campos válidos recebidos (`publishReview`, mantendo campos com divergência fora da escrita) e listagem dos campos obrigatórios faltantes (`REQUIRED_ALIGNMENT_FIELDS`) ->
    - Resposta do participante do grupo (`Campo: valor`, citando a mensagem ou sem citação via `latestOpen` quando houver apenas 1 alinhamento em aberto) ->
    - Atualização incremental na mesma linha da planilha, removendo os campos já preenchidos da cobrança até encerrar com `Todos os campos obrigatórios foram preenchidos!` ->
-   - **Auditoria pós-gravação célula a célula** na linha criada/atualizada.
-2. **Esquema completo da aba `Modelo alinhamento` (24 colunas em 2 linhas de cabeçalho)**:
+   - **Auditoria pós-gravação célula a célula** na aba e linha criadas/atualizadas.
+2. **Roteamento pelo Glossário, Novos Equipamentos e Duplicidade/Bordo (Obrigatório)**:
+   - **Leitura e associação do glossário**: confirmar que o bot lê o glossário, associa corretamente sinônimos/termos de bordo/equipamento, identifica a aba literal exata de destino, rejeita palavras genéricas (`motor`, `drive`, etc.) e **não grava errado** quando a aba é ausente (`tab_not_found`) ou ambígua (`ambiguous_tab`).
+   - **Primeiro acionamento no grupo**: confirmar que cria uma **nova linha** na aba identificada e vai atualizando/preenchendo essa mesma linha conforme forem informando e mencionando o bot.
+   - **Novo equipamento no mesmo grupo (ex.: era `MCP 1`, agora é `MCP 2`, ou outra máquina)**: confirmar que consulta o glossário novamente para identificar a aba correta, cria uma **nova linha** e preenche os dados conforme forem informando/mencionando, sem sobrescrever nem misturar com o equipamento anterior.
+   - **Dúvida entre mesmo equipamento já alinhado ou outro bordo + alerta de duplicidade**:
+     - Quando houver dúvida se trata do mesmo equipamento já alinhado anteriormente ou de outro bordo, validar que o bot questiona no grupo (ex.: *"É o mesmo equipamento que alinhamos tal hora, ou é [Nome do equipamento] de outro bordo?"*).
+     - **Outro bordo / outro equipamento**: validar que cria **nova linha** normal na aba identificada e preenche tudo sem alerta de duplicidade.
+     - **Mesmo equipamento (alinhamento repetido)**: validar que cria **nova linha** (sem sobrescrever a linha anterior), preenche tudo, grava em `Comments`/observações `Alerta, Bot detectou alinhamento em duplicidade` e **aplica formatação em NEGRITO nas células cujos valores estão diferentes da linha anterior** (deixando sem negrito o que permaneceu igual), para facilitar a leitura e interpretação pela analista.
+     - *Nota operacional*: se o questionamento de bordo, o alerta de duplicidade ou a formatação em negrito das diferenças ainda não estiverem implementados no código de produção, não altere código de produção por conta própria — registre a lacuna objetivamente e escale para `integracoes` propor a implementação ao usuário.
+3. **Esquema completo da aba de registros (24 colunas em 2 linhas de cabeçalho)**:
    - Use mocks realistas com os grupos e cabeçalhos reais: `Drive Machine` (`Vessel`, `Equipment / Tag`, `Equipment Class`, `Maker`, `Model`), `Histórico` (`Data`, `Motivação`, `Executor`, `Método`, `Axial Vertical`, `Axial Horizontal`, `Radial Vertical`, `Radial Horizontal`, `Coupling GAP`), `Pés de fixação` (`Padrão`), `Tolerâncias` (`Axial Tolerance`, `Radial Tolerance`, `Coupling GAP Tolerance`), `Coupling` (`Maker/Model` não mapeada), `Máquina Estacionária` (`Equipment Class`, `Maker`, `Model`, `Document`) e `Reference` (`Comments`).
-3. **Conferência obrigatória de cada célula gravada**:
-   - Compare os valores efetivamente gravados em cada coluna com os dados informados/completados.
+4. **Conferência obrigatória de cada célula gravada**:
+   - Compare os valores efetivamente gravados em cada coluna (e na aba correta) com os dados informados/completados.
    - Valide **colunas com títulos repetidos** (`Equipment Class`, `Maker`, `Model` entre `Drive Machine` e `Máquina Estacionária`).
    - Valide preservação de **sinais** (`+`/`-`), **decimais** e **unidades** (`mm`, `cm`, `µm`, etc.).
    - Valide que **dados ausentes** recebem `'não informado'` em linhas novas e em células vazias durante atualizações.
-   - Valide que **valores já existentes** na linha atualizada são preservados (inclusive fórmulas/colunas não mapeadas como `Coupling > Maker/Model` e observações humanas em `Comments` junto dos marcadores `session:`, `confirmation:`, `group:`, `approved_by:`, `recorded_at:`).
+   - Valide que **valores já existentes** na linha atualizada são preservados (inclusive fórmulas/colunas não mapeadas como `Coupling > Maker/Model` e observações humanas em `Comments` junto dos marcadores `session:`, `confirmation:`, `group:`, `approved_by:`, `recorded_at:` e, quando aplicável, `Alerta, Bot detectou alinhamento em duplicidade`).
    - Valide que a releitura pós-gravação de `alignment_history.js` falha com `'Gravação não verificada na planilha'` se o estado lido divergir do gravado.
 
 ## Cenários Obrigatórios de Interação, Mídia e Resiliência

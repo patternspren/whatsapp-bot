@@ -14,6 +14,7 @@ function harness(entry, writeResult = {status:'updated',row:3}) {
   const proposals=new Map([['proposal',['proposal-key',entry]]]);
   const prepared=new Map();
   const mocks={
+    './alignment_tabs':require('../alignment_tabs'),
     '@whiskeysockets/baileys':{}, 'qrcode-terminal':{}, pino:()=>({}),
     googleapis:{google:{options(){},auth:{GoogleAuth:class{}},sheets:()=>({})}},
     fs:{readFileSync(){throw new Error('sem estado')},writeFileSync(){},appendFileSync(){},chmodSync(){}},
@@ -32,7 +33,7 @@ function harness(entry, writeResult = {status:'updated',row:3}) {
     })},
     './alignment_config':{loadAlignmentConfig:async()=>({})},
     './alignment_history':{
-      ...historyLib,
+      ...historyLib, listTabs:async()=>['Modelo alinhamento'],
       getRecordSchema:async()=>schema,
       resolveRecordTarget:async()=>({status:'ready', target:{row:3,revision:'latest',current:{}}, schema}),
       recordHistory:async(_sheets,_id,data,sessionId,options)=>{writes.push({data,sessionId,options});return writeResult;}

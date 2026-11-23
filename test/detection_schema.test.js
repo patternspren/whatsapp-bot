@@ -38,7 +38,7 @@ test('inicia sessão com detecção contextual e ignora conversa sem relação',
 
 test('lê títulos atuais com grupos e informa ao Gemini o esquema', async () => {
   const sheets = { spreadsheets: { values: { get: async () => ({data:{values:[['', 'Drive Machine'], ['', 'Vessel', 'Equipment / Tag', 'Maker', 'Comments']]}}) } } };
-  const schema = await getRecordSchema(sheets, 'test');
+  const schema = await getRecordSchema(sheets, 'test', 'Modelo alinhamento');
   assert.equal(schema[0].title, 'Vessel');
   assert.deepEqual(schema.find(c => c.title === 'Maker').mappedAs, ['maker']);
   const original = global.fetch;

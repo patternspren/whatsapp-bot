@@ -758,14 +758,14 @@ test('QA realista 5: múltiplos equipamentos, mensagem duplicada, 2 abertos exig
     // Verificação pós-gravação detecta divergência caso a planilha retorne dado diferente do escrito
     model.state.corruptNextAppend = true;
     const rev = crypto.createHash('sha256')
-      .update(JSON.stringify(['bram breeze', 'dg3', REALISTIC_GROUPS, REALISTIC_HEADERS, undefined, {}]))
+      .update(JSON.stringify(['Modelo alinhamento', 'bram breeze', 'dg3', REALISTIC_GROUPS, REALISTIC_HEADERS, undefined, {}]))
       .digest('hex');
     await assert.rejects(
       () => recordHistory(model.sheets, 'records-id', {
         vessel: 'BRAM Breeze',
         equipment: 'Diesel Generator #3',
         axial_vertical: '0.01 mm'
-      }, 'sess-dg3', { target: { row: null, revision: rev, current: {} }, confirmationId: 'conf-dg3' }),
+      }, 'sess-dg3', { target: { row: null, revision: rev, current: {}, tabTitle:'Modelo alinhamento' }, confirmationId: 'conf-dg3' }),
       /Gravação não verificada na planilha/
     );
   } finally {

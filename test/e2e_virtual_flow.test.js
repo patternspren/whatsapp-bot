@@ -554,3 +554,82 @@ test('E2E virtual: regressões (Glossário com Bordo, período de datas, verifyE
     bot.cleanup();
   }
 });
+
+test('E2E multiaba: imagem, dois grupos e atualização incremental preservam o histórico', async () => {
+  const template=createVirtualSheets();
+  const heads=template.rows.map(r=>[...r]);
+  const records={
+    'MCP':[...heads.map(r=>[...r]), ['JOE GRIFFIN','MCP','','17/11/2026']],
+    'Shaft gen - redutora ':[...heads.map(r=>[...r]), ['Navegantes Pride','Shaft gen/ Redutora','','09/03/2023']]
+  };
+  template.configTabs.Glossario=[['Taxonomia','Possiveis nomes','bordo'],
+    ['Propulsion Engine No.1','MCP; motor de propulsão; motor',''],
+    ['Propulsion Engine No.2','MCP; motor de propulsão; motor',''],
+    ['Shaft Generator No.1','shaft gen; gerador de eixo; motor','']];
+  template.configTabs['Configurações']=[['Maquina a ser alinhada / Drive Machine','Maquina estacionária'],['Gerador de eixo','Caixa redutora']];
+  const writes=[]; let imageSeen=false;
+  const base=template.sheets.spreadsheets;
+  const titleOf = range => range.match(/^'((?:[^']|'')*)'!/)?.[1].replace(/''/g,"'");
+  const colIndex = name => [...name].reduce((n,c)=>n*26+c.charCodeAt(0)-64,0)-1;
+  const sheets={spreadsheets:{
+    get:async args=>args.spreadsheetId==='config-id' ? base.get(args) : {data:{sheets:Object.keys(records).map(title=>({properties:{title}}))}},
+    values:{
+      get:async args=>{
+        if(args.spreadsheetId==='config-id') return base.values.get(args);
+        const rows=records[titleOf(args.range)]; assert.ok(rows, args.range);
+        return {data:{values:(args.range.endsWith('ZZ2')?rows.slice(0,2):rows).map(r=>[...r])}};
+      },
+      append:async({range,requestBody})=>{
+        const title=titleOf(range), rows=records[title]; writes.push(range);
+        rows.push([...requestBody.values[0]]);
+        return {data:{updates:{updatedRange:`'${title}'!A${rows.length}:L${rows.length}`}}};
+      },
+      batchUpdate:async({requestBody})=>{
+        for(const item of requestBody.data){
+          writes.push(item.range); const row=records[titleOf(item.range)];
+          const m=item.range.match(/!([A-Z]+)(\d+)$/); row[+m[2]-1][colIndex(m[1])]=item.values[0][0];
+        }
+      }
+    }
+  }};
+  const reply = value => ({ok:true,json:async()=>({candidates:[{content:{parts:[{text:JSON.stringify(value)}]}}]})});
+  const fetchHandler=async (_url,options)=>{
+    const parts=JSON.parse(options.body).contents[0].parts, prompt=parts[0].text;
+    if(parts.some(p=>p.inline_data)) {imageSeen=true; return reply({records:[{vessel:'Navegantes Pride',equipment:'Gerador de eixo',facts:[]}]});}
+    if(prompt.includes('Extraia um registro')) {
+      const shaft=prompt.includes('Navegantes Pride');
+      const item=value=>({value,message:1,quote:value});
+      return reply({records:[{status:'incomplete',vessel:item(shaft?'Navegantes Pride':'Outro Barco'),equipment:item(shaft?'gerador de eixo':'MCP'),fields:{date:item('22/11/2026'),axial_vertical:item(shaft?'0.03':'0.02 mm')}}]});
+    }
+    return reply({decision:'related',alignment:true});
+  };
+  const bot=bootVirtualBot({sheets,fetchHandler});
+  const timestamp=Math.floor(Date.now()/1000), user='user@s.whatsapp.net';
+  try {
+    await Promise.all([
+      bot.handle({key:{remoteJid:'pride@g.us',id:'p1',participant:user},messageTimestamp:timestamp,_mockBuffer:'image',message:{imageMessage:{mimetype:'image/jpeg',caption:'@bot Navegantes Pride gerador de eixo 22/11/2026 axial vertical: 0.03',contextInfo:{mentionedJid:['5511999990000@s.whatsapp.net']}}}}),
+      bot.handle({key:{remoteJid:'mcp@g.us',id:'m1',participant:user},messageTimestamp:timestamp,message:{extendedTextMessage:{text:'@bot Outro Barco MCP 22/11/2026 axial vertical: 0.02 mm',contextInfo:{mentionedJid:['5511999990000@s.whatsapp.net']}}}})
+    ]);
+    assert.ok(imageSeen);
+    assert.equal(records['Shaft gen - redutora '].length,4);
+    assert.equal(records['Shaft gen - redutora '][2][3],'09/03/2023');
+    assert.equal(records.MCP[2][0],'JOE GRIFFIN'); assert.equal(records.MCP[3][0],'Outro Barco');
+    const prompt=bot.sentMessages.find(m=>m.group==='pride@g.us' && /linha 4/.test(m.text));
+    assert.ok(prompt); assert.match(prompt.text,/Shaft gen - redutora/); assert.match(prompt.text,/unidade das medições/i); assert.match(prompt.text,/Coupling GAP/);
+    await bot.handle({key:{remoteJid:'pride@g.us',id:'p2',participant:user},messageTimestamp:timestamp+1,message:{extendedTextMessage:{text:'Coupling GAP: -150 mm',contextInfo:{stanzaId:prompt.id}}}});
+    assert.equal(records['Shaft gen - redutora '][3][10],'-150 mm');
+    assert.equal(records['Shaft gen - redutora '][2][3],'09/03/2023');
+    assert.equal(records.MCP[2][0],'JOE GRIFFIN');
+    assert.ok(writes.some(r=>r.startsWith("'Shaft gen - redutora '!")));
+  } finally {bot.cleanup();}
+});
+
+test('E2E: falha de sincronização avisa uma vez e mantém diagnóstico no log', async () => {
+  const bot=bootVirtualBot({fetchHandler:async()=>({ok:false,status:403})});
+  try {
+    await bot.handle({key:{remoteJid:'failure@g.us',id:'f1',participant:'user@s.whatsapp.net'},messageTimestamp:Math.floor(Date.now()/1000),message:{extendedTextMessage:{text:'@bot BRAM Atlas MCP',contextInfo:{mentionedJid:['5511999990000@s.whatsapp.net']}}}});
+    await bot.tick(); await bot.tick();
+    assert.equal(bot.sentMessages.filter(m=>/não consegui sincronizar/i.test(m.text)).length,1);
+    assert.ok(bot.consoleErrors.some(line=>line.includes('Gemini HTTP 403')));
+  } finally { bot.cleanup(); }
+});

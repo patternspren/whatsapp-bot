@@ -6,6 +6,7 @@ const vm=require('node:vm');
 test('ignora mensagens até a menção e então envia o contexto recente ao rastreador',async()=>{
   const tracked=[];
   const mocks={
+    './alignment_tabs':require('../alignment_tabs'),
     '@whiskeysockets/baileys':{}, 'qrcode-terminal':{}, pino:()=>({}),
     googleapis:{google:{options(){},auth:{GoogleAuth:class{}},sheets:()=>({})}},
     fs:{readFileSync(){throw new Error('sem estado')},writeFileSync(){}},

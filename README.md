@@ -49,3 +49,9 @@ IDs processados, sessões, propostas e pendências ficam em arquivos locais priv
 ## Verificação
 
 Rode `npm test` para verificar a confirmação completa, o destino da gravação, a ativação por menção e o registro sequencial de equipamentos. Use um grupo de teste e dados fictícios para conferir a operação no WhatsApp e no Google Sheets.
+
+## Grupos e abas de registros
+
+Com `ALLOWED_GROUP_JIDS` vazio, o bot aceita menções em qualquer grupo; preenchida, a variável restringe o atendimento aos grupos listados. As sessões e respostas são isoladas por grupo.
+
+A planilha de registros pode ter uma aba por família de equipamento. O destino é identificado usando os nomes das abas e a configuração de glossário e combinações; quando não houver correspondência segura, o bot registra uma pendência e avisa o grupo. A aba única `Modelo alinhamento` continua sendo aceita para planilhas antigas. Cada novo alinhamento com data completa diferente é registrado em uma nova linha; respostas posteriores à mesma sessão atualizam a linha já criada.

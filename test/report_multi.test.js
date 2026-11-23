@@ -10,6 +10,7 @@ test('relatório com quatro geradores grava imediatamente e cobra campos faltant
   const writes = [];
   const proposals = [];
   const mocks = {
+    './alignment_tabs': require('../alignment_tabs'),
     '@whiskeysockets/baileys': {}, 'qrcode-terminal': {}, pino: () => ({}),
     googleapis: { google: { options() {}, auth: { GoogleAuth: class {} }, sheets: () => ({}) } },
     fs: { readFileSync() { throw new Error('sem estado'); }, appendFileSync() {}, chmodSync() {} },
@@ -23,7 +24,7 @@ test('relatório com quatro geradores grava imediatamente e cobra campos faltant
     }}), parseCorrection: () => [], isApproval: () => false},
     './alignment_config': { loadAlignmentConfig: async () => ({}) },
     './alignment_history': {
-      ...history,
+      ...history, listTabs:async()=>['Modelo alinhamento'],
       resolveRecordTarget: async (_sheets, _id, _data, sessionId) => ({status:'ready', target:{row:3, revision:sessionId, current:{}}, schema:[
         {title:'Vessel',group:'',mappedAs:['vessel']},
         {title:'Equipment / Tag',group:'',mappedAs:['equipment']},

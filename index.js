@@ -116,6 +116,8 @@ const CONFIG_TTL_MS = 30 * 60 * 1000;
 const groupTitleCache = new Map();
 const {createConfirmations, parseCorrection, isApproval} = require('./confirmations');
 const history = require('./alignment_history');
+const { resolveTargetTab } = require('./alignment_tabs');
+const notificationStates = new Set();
 const confirmations = createConfirmations(path.join(__dirname, 'alignment-confirmations.json'));
 const confirmationQueues = new Map();
 const groupMessageQueues = new Map();
@@ -227,7 +229,23 @@ function getMissingRequiredFields(effectiveData, conflicts = []) {
 
 async function publishReview(sock, group, sessionId, proposal, options = {}) {
   const { data, conflicts = [] } = proposal;
-  const { target: resolved, status, schema } = await history.resolveRecordTarget(sheets, spreadsheetId, data, sessionId);
+  const tabs = await history.listTabs(sheets, spreadsheetId);
+  const routing = proposal.tabTitle && tabs.includes(proposal.tabTitle)
+    ? {status:'ready', tabTitle:proposal.tabTitle}
+    : resolveTargetTab({tabs, config:await getAlignmentConfig(), data, contextText:proposal.contextText});
+  if (routing.status !== 'ready') {
+    const reason = routing.status;
+    const state = [group, sessionId, reason, ...routing.tabs].join('|');
+    if (!notificationStates.has(state)) {
+      appendPending({groupJid:group, sessionId, reason, tabs:routing.tabs});
+      const prefix = reason === 'ambiguous_tab' ? 'Encontrei mais de uma aba possível. Informe qual deve ser usada.' : 'Não encontrei uma aba para esse equipamento.';
+      if (!sock) return false;
+      try { await sock.sendMessage(group, {text:prefix + ' Abas disponíveis: ' + tabs.map(t => t.trim()).join(', ') + '.'}); notificationStates.add(state); } catch { return false; }
+    }
+    return true;
+  }
+  const tabTitle = routing.tabTitle;
+  const { target: resolved, status, schema } = await history.resolveRecordTarget(sheets, spreadsheetId, data, sessionId, tabTitle);
   const lostExistingRow = proposal.requireExisting && !resolved?.row;
   const target = lostExistingRow ? null : resolved;
 
@@ -276,7 +294,7 @@ async function publishReview(sock, group, sessionId, proposal, options = {}) {
         ...mergedCurrent,
         vessel: mergedCurrent.vessel || data.vessel,
         equipment: mergedCurrent.equipment || data.equipment
-      }, sessionId);
+      }, sessionId, tabTitle);
       nextTarget = refreshed.target || { ...target, row, current: mergedCurrent };
     } catch {
       nextTarget = { ...target, row, current: mergedCurrent };
@@ -308,19 +326,20 @@ async function publishReview(sock, group, sessionId, proposal, options = {}) {
     ].filter(Boolean).join('\n');
   } else if (missing.length === 0 && conflicts.length === 0) {
     const header = writeResult.status === 'appended'
-      ? `Dados gravados na nova linha ${row} da planilha${identityLabel ? ` (${identityLabel})` : ''}.`
-      : `Dados atualizados na linha ${row} da planilha${identityLabel ? ` (${identityLabel})` : ''}.`;
+      ? `Dados gravados na nova linha ${row} da aba "${tabTitle.trim()}"${identityLabel ? ` (${identityLabel})` : ''}.`
+      : `Dados atualizados na linha ${row} da aba "${tabTitle.trim()}"${identityLabel ? ` (${identityLabel})` : ''}.`;
     text = `${header}\nTodos os campos obrigatórios foram preenchidos!`;
   } else {
     const header = writeResult.status === 'appended'
-      ? `Dados recebidos gravados na nova linha ${row} da planilha${identityLabel ? ` (${identityLabel})` : ''}.`
+      ? `Dados recebidos gravados na nova linha ${row} da aba "${tabTitle.trim()}"${identityLabel ? ` (${identityLabel})` : ''}.`
       : writeResult.status === 'updated'
-        ? `Dados atualizados na linha ${row} da planilha${identityLabel ? ` (${identityLabel})` : ''}.`
+        ? `Dados atualizados na linha ${row} da aba "${tabTitle.trim()}"${identityLabel ? ` (${identityLabel})` : ''}.`
         : `Linha ${row} conferida${identityLabel ? ` (${identityLabel})` : ''}.`;
     text = [
       header,
       proposal.attachmentPending ? 'A leitura do anexo falhou ou ficou incompleta; os dados da legenda foram gravados.' : '',
       ...conflicts.map(c => `Divergência em ${c.field}: legenda ${c.caption || 'não informada'}; imagem ${c.visual || 'não legível'}.`),
+      proposal.missingUnits?.length ? `Informe a unidade das medições: ${proposal.missingUnits.join(', ')} (por exemplo, mm).` : '',
       missing.length ? `Ainda faltam estas informações para completar a linha ${row}:\n` + missing.map(f => `- ${f.label}`).join('\n') : '',
       'Responda esta mensagem ou mencione o bot informando o que falta (ex.: “Executor: Navship” ou “Coupling GAP: 25 mm”). Vou preencher automaticamente na mesma linha.'
     ].filter(Boolean).join('\n');
@@ -330,6 +349,7 @@ async function publishReview(sock, group, sessionId, proposal, options = {}) {
     ...proposal,
     data: mergedCurrent,
     conflicts,
+    tabTitle,
     target: nextTarget ?? null,
     requireExisting: Boolean(row),
     text
@@ -371,6 +391,7 @@ if (geminiEnabled) {
     model: process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite',
     config: getAlignmentConfig,
     getRecordSchema: () => history.getRecordSchema(sheets, spreadsheetId),
+    getRecordTabs: () => history.listTabs(sheets, spreadsheetId),
     onExtract: (session, reason, extraction, transcript) => serializeConfirmations(session.group, async () => {
       const checkedRecords = verifyExtractions(extraction, transcript);
       const proposed = new Set();
@@ -458,8 +479,18 @@ if (geminiEnabled) {
           const key = fieldKeys[foldText(conflict.field)];
           if (key) data[key] = 'usuário passou informação divergente';
         }
+        const missingUnits = new Set(checked.missingUnits || []);
+        for (const conflict of conflicts) {
+          if (/^[+-]?\d+(?:[.,]\d+)?$/.test(String(conflict.caption || '').trim())) missingUnits.add(conflict.field);
+        }
+        for (const message of session.messages) {
+          const source = String(message.text || '').split('Conteúdo lido do anexo:')[0];
+          for (const match of source.matchAll(/\b(axial|radial)\s+(vertical|horizontal)\s*:\s*([+-]?\d+(?:[.,]\d+)?)(?![\d.,])([^\n;\/]*)/gi)) {
+            if (!/^\s*(?:mm|cm|µm|μm|um|mils?|in|pol)\b/i.test(match[4])) missingUnits.add(match[1] + ' ' + match[2]);
+          }
+        }
         const sent = await publishReview(activeSock, session.group, sessionId, {
-          data, conflicts, sourceVersion, startedAt:session.startedAt,
+          data, conflicts, missingUnits:[...missingUnits], sourceVersion, startedAt:session.startedAt, contextText:session.messages.map(m => m.text || '').join('\n'),
           attachmentPending: session.messages.some(m => /\[Leitura do anexo indisponível/.test(m.text)),
           authorizedSender: session.authorizedSender || session.messages.find(m => m.explicitMention && m.senderJid)?.senderJid || ''
         });
@@ -488,9 +519,17 @@ if (geminiEnabled) {
       if (!session.activatedByMention) return true;
       try {
         const result = await gemini.finish(session, 'sincronização periódica');
+        if (!result?.deliveryFailed) notificationStates.delete(session.group + '|' + session.startedAt + '|sheet_error');
         return result?.deliveryFailed ? false : true;
       }
-      catch (error) { console.error('Falha ao sincronizar dados de alinhamento:', error.message); return false; }
+      catch (error) {
+        console.error('Falha ao sincronizar dados de alinhamento:', String(error.message || 'erro desconhecido').replace(/(?:[\w.+-]+@[\w.-]+|https?:\/\/\S+)/g, '[oculto]'));
+        const state = session.group + '|' + session.startedAt + '|sheet_error';
+        if (!notificationStates.has(state) && activeSock) {
+          try { await activeSock.sendMessage(session.group, {text:'Não consegui sincronizar o alinhamento. Verifique a configuração e as abas da planilha; tentarei novamente.'}); notificationStates.add(state); } catch {}
+        }
+        return false;
+      }
     },
     finish: async (session, reason) => {
       if (!session.activatedByMention) return;
@@ -591,7 +630,8 @@ async function handleConfirmation(sock, msg, text, quotedId) {
 
   try {
     console.log('Atualização incremental recebida:', groupJid, sessionId, corrections.map(c => c.key).join(','));
-    const schema = await history.getRecordSchema(sheets, spreadsheetId);
+    const changedEquipment = corrections.some(c => c.key === 'equipment' && history.equipmentIdentity(c.value) !== history.equipmentIdentity(entry.data.equipment));
+    const schema = await history.getRecordSchema(sheets, spreadsheetId, changedEquipment ? undefined : entry.tabTitle);
     const allowed = new Set(schema.flatMap(column => column.mappedAs || []));
     if (corrections.some(({ key }) => !allowed.has(key === 'observations' ? 'comments' : key))) {
       await reply('Um dos campos informados não tem coluna reconhecida na planilha.');
@@ -602,7 +642,7 @@ async function handleConfirmation(sock, msg, text, quotedId) {
       !corrections.some(change => change.key === parseCorrection(`${conflict.field}: 0 mm`)[0]?.key)
     );
     const saved = await publishReview(sock, groupJid, sessionId, {
-      data, conflicts, sourceVersion: entry.sourceVersion, startedAt: entry.startedAt, parentKey: key,
+      data, conflicts, missingUnits:(entry.missingUnits || []).filter(label => !corrections.some(change => foldText(label).replace(/ /g, '_') === change.key)), tabTitle: changedEquipment ? undefined : entry.tabTitle, sourceVersion: entry.sourceVersion, startedAt: entry.startedAt, parentKey: key,
       authorizedSender: entry.authorizedSender, attachmentPending: entry.attachmentPending,
       requireExisting: Boolean(entry.target?.row || entry.requireExisting) && history.sameEquipment(data, entry.data)
     }, { senderId: approverId, confirmationId: key });
@@ -785,7 +825,14 @@ async function handleMessageInternal(sock, msg, options = {}) {
 async function handleMessage(sock, msg, options = {}) {
   const groupJid = msg?.key?.remoteJid || '';
   if (!groupJid.endsWith('@g.us') || msg.key.fromMe) return;
-  if (allowedGroupJids.size && !allowedGroupJids.has(groupJid.toLowerCase())) return;
+  if (allowedGroupJids.size && !allowedGroupJids.has(groupJid.toLowerCase())) {
+    const state = groupJid + '|restricted';
+    if (explicitlyMentionsBot(sock, unwrapMessage(msg.message)) && !notificationStates.has(state)) {
+      console.log('Mensagem ignorada: grupo fora da lista permitida.');
+      try { await sock.sendMessage(groupJid, {text:'Este grupo não está autorizado na configuração do bot.'}); notificationStates.add(state); } catch {}
+    }
+    return;
+  }
   if (options.replay) return handleMessageInternal(sock, msg, options);
   return serializeGroup(groupJid, () => handleMessageInternal(sock, msg, options));
 }
@@ -796,6 +843,7 @@ let shuttingDown = false;
 
 async function startBot() {
   if (shuttingDown) return;
+  console.log(allowedGroupJids.size ? `Bot restrito a ${allowedGroupJids.size} grupo(s).` : 'Bot habilitado para todos os grupos.');
   if (geminiEnabled) await getAlignmentConfig();
   const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, 'auth_info_baileys'));
   const sock = makeWASocket({
