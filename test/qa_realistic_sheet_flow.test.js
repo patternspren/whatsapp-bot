@@ -28,6 +28,8 @@ const REALISTIC_HEADERS = [
   'Equipment Class', 'Maker', 'Model', 'Document',
   'Comments'
 ];
+REALISTIC_GROUPS.splice(20, 0, '');
+REALISTIC_HEADERS.splice(20, 0, 'Nome do grupo whatsapp');
 
 function createRealisticModelSheet(initialDataRows = []) {
   const rows = [
@@ -35,6 +37,7 @@ function createRealisticModelSheet(initialDataRows = []) {
     [...REALISTIC_HEADERS],
     ...initialDataRows.map(row => {
       const padded = [...row];
+      padded.splice(20, 0, '');
       while (padded.length < REALISTIC_HEADERS.length) padded.push('');
       return padded;
     })
@@ -146,14 +149,16 @@ function createRealisticModelSheet(initialDataRows = []) {
     sheets,
     rows,
     state,
-    cell: (rowNum, colIndex) => rows[rowNum - 1]?.[colIndex]
+    cell: (rowNum, colIndex) => rows[rowNum - 1]?.[colIndex >= 20 ? colIndex + 1 : colIndex]
   };
 }
 
-function bootRealisticBot({ env = {}, fetchHandler, sheetModel, downloadMediaMessageOverride = null }) {
+function bootRealisticBot({ env = {}, fetchHandler, sheetModel, downloadMediaMessageOverride = null, autoSelect = true }) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wpp-qa-'));
   const model = sheetModel || createRealisticModelSheet();
   const sentMessages = [];
+  const pendingSelections = [];
+  const lastSender = new Map();
   const consoleErrors = [];
   let seq = 0;
   const origFetch = global.fetch;
@@ -167,13 +172,22 @@ function bootRealisticBot({ env = {}, fetchHandler, sheetModel, downloadMediaMes
     sendMessage: async (group, message) => {
       seq += 1;
       const id = `bot-msg-${seq}`;
-      sentMessages.push({ group, id, ...message });
+      if (autoSelect && /Se a lista interativa não aparecer/.test(message.text || '')) { /* alternativa de seleção */ }
+      else if (autoSelect && message.sections) pendingSelections.push({group, rowId:message.sections[0].rows[0].rowId});
+      else sentMessages.push({ group, id, ...message });
       return { key: { id, remoteJid: group } };
+    },
+    relayMessage: async (group, message, options) => {
+      const list = message.listMessage;
+      const display = {text:list.description, sections:list.sections};
+      if (autoSelect) pendingSelections.push({group, rowId:list.sections[0].rows[0].rowId});
+      else sentMessages.push({group, id:options.messageId, ...display});
     },
     updateMediaMessage: async (msg) => msg
   };
 
   const fakeBaileys = {
+    generateWAMessageFromContent: (group, message) => ({key:{id:`list-${++seq}`,remoteJid:group},message}),
     default: () => ({
       ...sock,
       ev: { on() {}, removeAllListeners() {} },
@@ -241,6 +255,14 @@ function bootRealisticBot({ env = {}, fetchHandler, sheetModel, downloadMediaMes
   );
   context.setSock(sock);
 
+  async function choosePending() {
+    while (pendingSelections.length) {
+      const {group, rowId} = pendingSelections.shift();
+      await context.handle(sock, {key:{remoteJid:group,id:`selection-${++seq}`,participant:lastSender.get(group) || 'user@s.whatsapp.net'},
+        message:{listResponseMessage:{singleSelectReply:{selectedRowId:rowId}}}});
+    }
+  }
+
   return {
     tmpDir,
     sock,
@@ -248,8 +270,8 @@ function bootRealisticBot({ env = {}, fetchHandler, sheetModel, downloadMediaMes
     consoleErrors,
     model,
     confirmations: context.confirmations,
-    handle: (msg) => context.handle(sock, msg),
-    tick: () => context.tracker.tick(),
+    handle: async (msg) => { lastSender.set(msg.key.remoteJid, msg.key.participant); await context.handle(sock, msg); await choosePending(); },
+    tick: async () => { await context.tracker.tick(); await choosePending(); },
     readPending: () => {
       const p = path.join(tmpDir, 'pending-alignment.jsonl');
       if (!fs.existsSync(p)) return [];
@@ -268,6 +290,210 @@ const geminiJsonResponse = (obj) => ({
   json: async () => ({
     candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }]
   })
+});
+
+function numericSelectionBot({twoRecords = false, shortHeaders = false} = {}) {
+  const model = createRealisticModelSheet();
+  if (shortHeaders) {
+    model.rows[0] = ['Drive Machine', '', 'Histórico', 'Reference'];
+    model.rows[1] = ['Vessel', 'Equipment / Tag', 'Data', 'Comments'];
+  }
+  const originalGet = model.sheets.spreadsheets.get;
+  model.sheets.spreadsheets.get = args => args.spreadsheetId === 'config-id'
+    ? originalGet(args) : Promise.resolve({data:{sheets:['MCP','Shaft gen - redutora '].map(title => ({properties:{title}}))}});
+  const ranges = [];
+  const append = model.sheets.spreadsheets.values.append;
+  model.sheets.spreadsheets.values.append = async args => { ranges.push(args.range); return append(args); };
+  const bot = bootRealisticBot({sheetModel:model, autoSelect:false, fetchHandler:async (_url, options) => {
+    const prompt = JSON.parse(options.body).contents[0].parts[0].text;
+    if (!prompt.includes('Extraia um registro')) return geminiJsonResponse({decision:'related'});
+    return geminiJsonResponse({records:(twoRecords ? ['MCP 1','MCP 2'] : ['MCP 1']).map(equipment => ({
+      status:'incomplete', vessel:{value:'BRAM Atlas',message:1,quote:'BRAM Atlas'},
+      equipment:{value:equipment,message:1,quote:equipment},fields:{}
+    }))});
+  }});
+  const group='numerico@g.us', participant='user@s.whatsapp.net';
+  const start = () => bot.handle({key:{remoteJid:group,id:'start',participant},messageTimestamp:Math.floor(Date.now()/1000),
+    message:{extendedTextMessage:{text:'@bot BRAM Atlas MCP 1 MCP 2',contextInfo:{mentionedJid:['5511999990000@s.whatsapp.net']}}}});
+  const reply = (text, id, quoted) => bot.handle({key:{remoteJid:group,id,participant},message:{extendedTextMessage:{
+    text, contextInfo:quoted ? {stanzaId:quoted} : {}
+  }}});
+  return {model,bot,ranges,start,reply};
+}
+
+test('respostas citadas aceitam menção, pontuação e nomes de opção', async () => {
+  for (const [text, expected] of [['@5511999990000 1.', "'MCP'!"], ['Aba 2', "'Shaft gen - redutora '!"], ['Opção 1', "'MCP'!"], ['#1', "'MCP'!"]]) {
+    const h = numericSelectionBot();
+    try {
+      await h.start();
+      const fallback = h.bot.sentMessages.find(m => /Se a lista interativa/.test(m.text || ''));
+      await h.reply(text, 'choice', fallback.id);
+      assert.equal(h.model.rows.length,3, text);
+      assert.ok(h.ranges[0].startsWith(expected), text);
+    } finally { h.bot.cleanup(); }
+  }
+});
+
+test('resposta sem citação seleciona a única escolha aberta', async () => {
+  const h = numericSelectionBot();
+  try {
+    await h.start();
+    await h.reply('2', 'choice');
+    assert.equal(h.model.rows.length,3);
+    assert.ok(h.ranges[0].startsWith("'Shaft gen - redutora '!"));
+  } finally { h.bot.cleanup(); }
+});
+
+test('resposta sem citação com duas escolhas abertas pede referência', async () => {
+  const h = numericSelectionBot({twoRecords:true});
+  try {
+    await h.start();
+    assert.equal(h.bot.sentMessages.filter(m => /Se a lista interativa/.test(m.text || '')).length,2);
+    await h.reply('1', 'choice');
+    assert.equal(h.model.rows.length,2);
+    assert.match(h.bot.sentMessages.at(-1).text,/mais de uma escolha de aba.*Responder/);
+  } finally { h.bot.cleanup(); }
+});
+
+test('número fora do intervalo avisa e permite nova tentativa', async () => {
+  const h = numericSelectionBot();
+  try {
+    await h.start();
+    const fallback = h.bot.sentMessages.find(m => /Se a lista interativa/.test(m.text || ''));
+    await h.reply('0', 'zero', fallback.id);
+    assert.match(h.bot.sentMessages.at(-1).text,/entre 1 e 2/);
+    await h.reply('3', 'high');
+    assert.match(h.bot.sentMessages.at(-1).text,/entre 1 e 2/);
+    assert.equal(h.model.rows.length,2);
+    await h.reply('1', 'valid');
+    assert.equal(h.model.rows.length,3);
+  } finally { h.bot.cleanup(); }
+});
+
+test('aba com cabeçalho curto grava o nome do grupo em U', async () => {
+  const h = numericSelectionBot({shortHeaders:true});
+  try {
+    await h.start();
+    await h.reply('1', 'choice');
+    assert.equal(h.model.rows.length,3);
+    assert.equal(h.model.rows[2][20], 'BRAM Atlas');
+  } finally { h.bot.cleanup(); }
+});
+
+test('seleção interativa antecede gravação e mantém a aba e o grupo nas correções', async () => {
+  const model = createRealisticModelSheet();
+  const tabs = Array.from({length:15}, (_, i) => i === 10 ? 'Shaft gen - redutora ' : `Aba ${i + 1}`);
+  const originalGet = model.sheets.spreadsheets.get;
+  model.sheets.spreadsheets.get = async args => args.spreadsheetId === 'config-id'
+    ? originalGet(args) : {data:{sheets:tabs.map(title => ({properties:{title}}))}};
+  const ranges = [];
+  const originalAppend = model.sheets.spreadsheets.values.append;
+  const originalBatch = model.sheets.spreadsheets.values.batchUpdate;
+  model.sheets.spreadsheets.values.append = async args => { ranges.push(args.range); return originalAppend(args); };
+  model.sheets.spreadsheets.values.batchUpdate = async args => { ranges.push(...args.requestBody.data.map(x=>x.range)); return originalBatch(args); };
+  const bot = bootRealisticBot({sheetModel:model, autoSelect:false, fetchHandler:async (_url, options) => {
+    const prompt = JSON.parse(options.body).contents[0].parts[0].text;
+    if (prompt.includes('Extraia um registro')) return geminiJsonResponse({records:[{
+      status:'incomplete', vessel:{value:'BRAM Atlas',message:1,quote:'BRAM Atlas'},
+      equipment:{value:'MCP 1',message:1,quote:'MCP 1'}, fields:{}
+    }]});
+    return geminiJsonResponse({decision:'related'});
+  }});
+  const group = 'grupo-atlas@g.us', participant = '5521911112222@s.whatsapp.net';
+  try {
+    await bot.handle({key:{remoteJid:group,id:'m1',participant},messageTimestamp:Math.floor(Date.now()/1000),
+      message:{extendedTextMessage:{text:'@bot BRAM Atlas MCP 1',contextInfo:{mentionedJid:['5511999990000@s.whatsapp.net']}}}});
+    assert.equal(model.rows.length,2);
+    const lists = bot.sentMessages.filter(m => m.sections);
+    assert.equal(lists.length,2);
+    assert.deepEqual(lists.map(m => m.sections[0].rows.length),[10,5]);
+    assert.match(lists[1].text,/Shaft gen - redutora/);
+    const rowId = lists[1].sections[0].rows[0].rowId;
+    await bot.handle({key:{remoteJid:'outro@g.us',id:'foreign',participant},message:{listResponseMessage:{singleSelectReply:{selectedRowId:rowId}}}});
+    assert.equal(model.rows.length,2);
+    const fallback = bot.sentMessages.find(m => /Se a lista interativa/.test(m.text || ''));
+    await bot.handle({key:{remoteJid:group,id:'sel',participant},message:{extendedTextMessage:{text:'11',contextInfo:{stanzaId:fallback.id}}}});
+    assert.equal(model.rows.length,3);
+    await bot.handle({key:{remoteJid:group,id:'sel',participant},message:{listResponseMessage:{singleSelectReply:{selectedRowId:rowId}}}});
+    assert.equal(model.rows.length,3);
+    assert.equal(model.rows[2][20],'BRAM Atlas');
+    assert.ok(ranges.every(r => r.startsWith("'Shaft gen - redutora '!")));
+    const review = bot.sentMessages.at(-1);
+    await bot.handle({key:{remoteJid:group,id:'corr',participant},message:{extendedTextMessage:{text:'Executor: Navship',contextInfo:{stanzaId:review.id}}}});
+    assert.equal(model.rows.length,3);
+    assert.equal(model.cell(3,7),'Navship');
+    assert.ok(ranges.every(r => r.startsWith("'Shaft gen - redutora '!")));
+  } finally { bot.cleanup(); }
+});
+
+test('ausência do nome do grupo não inventa valor na coluna U', async () => {
+  const model = createRealisticModelSheet();
+  const bot = bootRealisticBot({sheetModel:model, autoSelect:false, fetchHandler:async (_url, options) => {
+    const prompt = JSON.parse(options.body).contents[0].parts[0].text;
+    if (prompt.includes('Extraia um registro')) return geminiJsonResponse({records:[{
+      status:'incomplete', vessel:{value:'BRAM Atlas',message:1,quote:'BRAM Atlas'},
+      equipment:{value:'MCP 1',message:1,quote:'MCP 1'}, fields:{}
+    }]});
+    return geminiJsonResponse({decision:'related'});
+  }});
+  bot.sock.groupMetadata = async () => { throw new Error('indisponível'); };
+  bot.sock.relayMessage = async () => { throw new Error('lista indisponível'); };
+  const group='unknown@g.us', participant='user@s.whatsapp.net';
+  try {
+    await bot.handle({key:{remoteJid:group,id:'m1',participant},messageTimestamp:Math.floor(Date.now()/1000),
+      message:{extendedTextMessage:{text:'@bot BRAM Atlas MCP 1',contextInfo:{mentionedJid:['5511999990000@s.whatsapp.net']}}}});
+    const fallback=bot.sentMessages.find(m=>/Se a lista interativa/.test(m.text || ''));
+    assert.ok(fallback);
+    await bot.handle({key:{remoteJid:group,id:'selection',participant},message:{extendedTextMessage:{text:'1',contextInfo:{stanzaId:fallback.id}}}});
+    assert.equal(model.rows.length,3);
+    assert.equal(model.rows[2][20],'');
+    assert.match(bot.sentMessages.at(-1).text,/não atualizei a coluna U/);
+  } finally { bot.cleanup(); }
+});
+
+test('dados recebidos antes da escolha permanecem na solicitação', async () => {
+  const model = createRealisticModelSheet();
+  const bot = bootRealisticBot({sheetModel:model, autoSelect:false, fetchHandler:async (_url, options) => {
+    const prompt = JSON.parse(options.body).contents[0].parts[0].text;
+    if (prompt.includes('Extraia um registro')) return geminiJsonResponse({records:[{
+      status:'incomplete', vessel:{value:'BRAM Atlas',message:1,quote:'BRAM Atlas'},
+      equipment:{value:'MCP 1',message:1,quote:'MCP 1'},
+      fields:prompt.includes('Equipe Navship') ? {executor:{value:'Equipe Navship',message:2,quote:'Equipe Navship'}} : {}
+    }]});
+    return geminiJsonResponse({decision:'related'});
+  }});
+  const group='multi@g.us', participant='user@s.whatsapp.net', timestamp=Math.floor(Date.now()/1000);
+  try {
+    await bot.handle({key:{remoteJid:group,id:'m1',participant},messageTimestamp:timestamp,
+      message:{extendedTextMessage:{text:'@bot BRAM Atlas MCP 1',contextInfo:{mentionedJid:['5511999990000@s.whatsapp.net']}}}});
+    const list=bot.sentMessages.find(m=>m.sections);
+    await bot.handle({key:{remoteJid:group,id:'m2',participant},messageTimestamp:timestamp+1,message:{conversation:'Executor: Equipe Navship'}});
+    assert.equal(model.rows.length,2);
+    await bot.handle({key:{remoteJid:group,id:'selection',participant},message:{listResponseMessage:{singleSelectReply:{selectedRowId:list.sections[0].rows[0].rowId}}}});
+    assert.equal(model.rows.length,3);
+    assert.equal(model.cell(3,7),'Equipe Navship');
+  } finally { bot.cleanup(); }
+});
+
+test('coluna U com outro cabeçalho bloqueia a gravação', async () => {
+  const model = createRealisticModelSheet();
+  model.rows[1][20] = 'Outro campo';
+  const bot = bootRealisticBot({sheetModel:model, autoSelect:false, fetchHandler:async (_url, options) => {
+    const prompt=JSON.parse(options.body).contents[0].parts[0].text;
+    return prompt.includes('Extraia um registro') ? geminiJsonResponse({records:[{
+      status:'incomplete',vessel:{value:'BRAM Atlas',message:1,quote:'BRAM Atlas'},
+      equipment:{value:'MCP 1',message:1,quote:'MCP 1'},fields:{}
+    }]}) : geminiJsonResponse({decision:'related'});
+  }});
+  const group='occupied@g.us', participant='user@s.whatsapp.net';
+  try {
+    await bot.handle({key:{remoteJid:group,id:'m1',participant},messageTimestamp:Math.floor(Date.now()/1000),
+      message:{extendedTextMessage:{text:'@bot BRAM Atlas MCP 1',contextInfo:{mentionedJid:['5511999990000@s.whatsapp.net']}}}});
+    const list=bot.sentMessages.find(m=>m.sections);
+    await bot.handle({key:{remoteJid:group,id:'selection',participant},message:{listResponseMessage:{singleSelectReply:{selectedRowId:list.sections[0].rows[0].rowId}}}});
+    assert.equal(model.rows.length,2);
+    assert.ok(bot.sentMessages.some(m=>/coluna U desta aba está ocupada/.test(m.text || '')));
+  } finally { bot.cleanup(); }
 });
 
 test('QA realista 1: fluxo completo em 24 colunas com gravação imediata, atualização sem/com citação, títulos repetidos, encerramento e auditoria célula a célula', async () => {

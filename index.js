@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, generateWAMessageFromContent } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const { google } = require('googleapis');
 google.options({ fetchImplementation: fetch });
@@ -116,7 +116,6 @@ const CONFIG_TTL_MS = 30 * 60 * 1000;
 const groupTitleCache = new Map();
 const {createConfirmations, parseCorrection, isApproval} = require('./confirmations');
 const history = require('./alignment_history');
-const { resolveTargetTab } = require('./alignment_tabs');
 const notificationStates = new Set();
 const confirmations = createConfirmations(path.join(__dirname, 'alignment-confirmations.json'));
 const confirmationQueues = new Map();
@@ -157,7 +156,8 @@ const GROUP_ARM_WINDOW_MS = 2 * 60 * 60 * 1000;
 
 function messageContextInfo(content) {
   return content.extendedTextMessage?.contextInfo || content.imageMessage?.contextInfo ||
-    content.documentMessage?.contextInfo || content.videoMessage?.contextInfo || {};
+    content.documentMessage?.contextInfo || content.videoMessage?.contextInfo ||
+    content.listResponseMessage?.contextInfo || {};
 }
 
 function jidDigits(value) {
@@ -217,6 +217,13 @@ function stripMentions(text) {
     .join('\n');
 }
 
+function tabChoiceIndex(text) {
+  const match = stripMentions(text).match(/^(?:(?:aba|op[cç][aã]o|#)\s*)?(\d+)[.)\s-]*$/i);
+  if (!match) return null;
+  const number = Number(match[1]);
+  return Number.isSafeInteger(number) ? number - 1 : Number.MAX_SAFE_INTEGER;
+}
+
 function getMissingRequiredFields(effectiveData, conflicts = []) {
   const conflictLabels = new Set(conflicts.map(c => foldText(c.field)));
   return REQUIRED_ALIGNMENT_FIELDS.filter(({ key, label }) => {
@@ -229,27 +236,62 @@ function getMissingRequiredFields(effectiveData, conflicts = []) {
 
 async function publishReview(sock, group, sessionId, proposal, options = {}) {
   const { data, conflicts = [] } = proposal;
-  const tabs = await history.listTabs(sheets, spreadsheetId);
-  const routing = proposal.tabTitle && tabs.includes(proposal.tabTitle)
-    ? {status:'ready', tabTitle:proposal.tabTitle}
-    : resolveTargetTab({tabs, config:await getAlignmentConfig(), data, contextText:proposal.contextText});
-  if (routing.status !== 'ready') {
-    const reason = routing.status;
-    const state = [group, sessionId, reason, ...routing.tabs].join('|');
-    if (!notificationStates.has(state)) {
-      appendPending({groupJid:group, sessionId, reason, tabs:routing.tabs});
-      const prefix = reason === 'ambiguous_tab' ? 'Encontrei mais de uma aba possível. Informe qual deve ser usada.' : 'Não encontrei uma aba para esse equipamento.';
-      if (!sock) return false;
-      try { await sock.sendMessage(group, {text:prefix + ' Abas disponíveis: ' + tabs.map(t => t.trim()).join(', ') + '.'}); notificationStates.add(state); } catch { return false; }
+  let selection = confirmations.selection(group, sessionId);
+  let tabTitle = proposal.tabTitle || (selection?.[1].status === 'selected' ? selection[1].tabTitle : '');
+  if (!tabTitle) {
+    if (selection?.[1].status === 'sent') {
+      confirmations.refreshSelection(selection[0], {proposal});
+      return true;
     }
-    return true;
+    const tabs = await history.listTabs(sheets, spreadsheetId, {fresh:true});
+    if (!tabs.length || !sock) return false;
+    const identity = [data.vessel, data.equipment].filter(history.isKnown).join(' — ');
+    const prompt = confirmations.prepare(group, sessionId, {kind:'tab-selection', tabs, proposal,
+      data, conflicts, authorizedSender:proposal.authorizedSender,
+      text:`Escolha a aba para ${identity || 'este alinhamento'} antes da gravação.`});
+    if (!prompt) return true;
+    try {
+      const sentIds = [];
+      for (let offset = 0; offset < tabs.length; offset += 10) {
+        const page = tabs.slice(offset, offset + 10);
+        try {
+          const sent = generateWAMessageFromContent(group, {listMessage:{
+            description: `${prompt.text}\n${page.map((title, i) => `${offset + i + 1}. ${title}`).join('\n')}`,
+            buttonText: 'Escolher aba',
+            listType: 1,
+            sections: [{title:`Abas ${offset + 1}–${offset + page.length}`, rows:page.map((title, i) => ({
+              title: `${offset + i + 1}. ${title}`.slice(0, 24), description:title.slice(0, 72),
+              rowId:`tab:${prompt.key}:${offset + i}`
+            }))}]
+          }}, {userJid:sock.user?.id});
+          if (!sent?.key?.id) throw new Error('Lista sem identificador');
+          await sock.relayMessage(group, sent.message, {messageId:sent.key.id});
+          sentIds.push(sent.key.id);
+        } catch { console.warn('Não foi possível enviar a lista interativa; usando seleção numerada.'); }
+      }
+      const fallback = await sock.sendMessage(group, {text:`${prompt.text}\nSe a lista interativa não aparecer, responda a esta mensagem com o número da aba:\n${tabs.map((title,i) => `${i + 1}. ${title}`).join('\n')}`});
+      if (!fallback?.key?.id) throw new Error('Mensagem de alternativa sem identificador');
+      sentIds.push(fallback.key.id);
+      confirmations.sent(prompt.key, sentIds);
+      return true;
+    } catch { return false; }
   }
-  const tabTitle = routing.tabTitle;
-  const { target: resolved, status, schema } = await history.resolveRecordTarget(sheets, spreadsheetId, data, sessionId, tabTitle);
+  const tabs = await history.listTabs(sheets, spreadsheetId, {fresh:true});
+  if (!tabs.includes(tabTitle)) {
+    appendPending({groupJid:group, sessionId, reason:'aba selecionada não existe mais'});
+    await sock.sendMessage(group, {text:'A aba selecionada não está mais disponível. Marque o bot novamente para selecionar outra aba.'});
+    return false;
+  }
+  const { target: resolved, status, groupColumnAvailable } = await history.resolveRecordTarget(sheets, spreadsheetId, data, sessionId, tabTitle);
+  if (!groupColumnAvailable) {
+    await sock.sendMessage(group, {text:'A coluna U desta aba está ocupada por outro campo. Não gravei o alinhamento; verifique a estrutura da planilha.'});
+    return false;
+  }
+  let groupName = proposal.groupName || '';
+  try { groupName = (await sock.groupMetadata(group)).subject || groupName; } catch {}
   const lostExistingRow = proposal.requireExisting && !resolved?.row;
   const target = lostExistingRow ? null : resolved;
 
-  const conflictKeys = new Set(conflicts.map(c => foldText(c.field)));
   const fieldKeyByLabel = {
     'axial vertical': 'axial_vertical',
     'axial horizontal': 'axial_horizontal',
@@ -276,6 +318,7 @@ async function publishReview(sock, group, sessionId, proposal, options = {}) {
     writeResult = await history.recordHistory(sheets, spreadsheetId, {
       ...dataToWrite,
       groupJid: group,
+      groupName,
       approvedBy: options.senderId || proposal.authorizedSender || ''
     }, sessionId, { target, confirmationId: writeId });
 
@@ -350,9 +393,10 @@ async function publishReview(sock, group, sessionId, proposal, options = {}) {
     data: mergedCurrent,
     conflicts,
     tabTitle,
+    groupName,
     target: nextTarget ?? null,
     requireExisting: Boolean(row),
-    text
+    text: text + (!groupName ? '\nNão consegui obter o nome deste grupo; não atualizei a coluna U.' : '')
   });
   if (!prompt) return true;
   if (!sock) return false;
@@ -491,6 +535,7 @@ if (geminiEnabled) {
         }
         const sent = await publishReview(activeSock, session.group, sessionId, {
           data, conflicts, missingUnits:[...missingUnits], sourceVersion, startedAt:session.startedAt, contextText:session.messages.map(m => m.text || '').join('\n'),
+          groupName: [...session.messages].reverse().find(m => m.groupName)?.groupName || '',
           attachmentPending: session.messages.some(m => /\[Leitura do anexo indisponível/.test(m.text)),
           authorizedSender: session.authorizedSender || session.messages.find(m => m.explicitMention && m.senderJid)?.senderJid || ''
         });
@@ -575,6 +620,11 @@ async function handleConfirmation(sock, msg, text, quotedId) {
   if (!confirmation) return false;
 
   const [key, entry] = confirmation;
+  if (entry.kind === 'tab-selection') {
+    const index = tabChoiceIndex(text);
+    if (index !== null) return handleTabSelection(sock, msg, `tab:${key}:${index}`);
+    return false;
+  }
   console.log('Resposta de conferência recebida:', groupJid, entry.sessionId, messageId);
   const reply = async text => {
     try { await sock.sendMessage(groupJid, { text, quoted: msg }); } catch {}
@@ -630,8 +680,7 @@ async function handleConfirmation(sock, msg, text, quotedId) {
 
   try {
     console.log('Atualização incremental recebida:', groupJid, sessionId, corrections.map(c => c.key).join(','));
-    const changedEquipment = corrections.some(c => c.key === 'equipment' && history.equipmentIdentity(c.value) !== history.equipmentIdentity(entry.data.equipment));
-    const schema = await history.getRecordSchema(sheets, spreadsheetId, changedEquipment ? undefined : entry.tabTitle);
+    const schema = await history.getRecordSchema(sheets, spreadsheetId, entry.tabTitle);
     const allowed = new Set(schema.flatMap(column => column.mappedAs || []));
     if (corrections.some(({ key }) => !allowed.has(key === 'observations' ? 'comments' : key))) {
       await reply('Um dos campos informados não tem coluna reconhecida na planilha.');
@@ -642,7 +691,7 @@ async function handleConfirmation(sock, msg, text, quotedId) {
       !corrections.some(change => change.key === parseCorrection(`${conflict.field}: 0 mm`)[0]?.key)
     );
     const saved = await publishReview(sock, groupJid, sessionId, {
-      data, conflicts, missingUnits:(entry.missingUnits || []).filter(label => !corrections.some(change => foldText(label).replace(/ /g, '_') === change.key)), tabTitle: changedEquipment ? undefined : entry.tabTitle, sourceVersion: entry.sourceVersion, startedAt: entry.startedAt, parentKey: key,
+      data, conflicts, missingUnits:(entry.missingUnits || []).filter(label => !corrections.some(change => foldText(label).replace(/ /g, '_') === change.key)), tabTitle: entry.tabTitle, groupName:entry.groupName, sourceVersion: entry.sourceVersion, startedAt: entry.startedAt, parentKey: key,
       authorizedSender: entry.authorizedSender, attachmentPending: entry.attachmentPending,
       requireExisting: Boolean(entry.target?.row || entry.requireExisting) && history.sameEquipment(data, entry.data)
     }, { senderId: approverId, confirmationId: key });
@@ -659,13 +708,53 @@ async function handleConfirmation(sock, msg, text, quotedId) {
   return true;
 }
 
+async function handleTabSelection(sock, msg, rowId) {
+  const match = /^tab:([a-f0-9]{64}):(-?\d+)$/.exec(rowId || '');
+  if (!match) return false;
+  const group = msg.key.remoteJid;
+  const entry = confirmations.get(match[1]);
+  const current = entry && confirmations.selection(group, entry.sessionId);
+  if (!entry || entry.group !== group || entry.kind !== 'tab-selection' || current?.[0] !== match[1]) return true;
+  if (!isAuthorizedForConfirmation(msg, entry)) {
+    await sock.sendMessage(group, {text:'Você não está autorizado a responder a esta solicitação.'});
+    return true;
+  }
+  if (entry.createdAt && Date.now() - entry.createdAt > PROPOSAL_TTL_MS) {
+    await sock.sendMessage(group, {text:'Esta seleção expirou. Marque o bot novamente para iniciar outra solicitação.'});
+    return true;
+  }
+  const index = Number(match[2]);
+  if (!Number.isSafeInteger(index) || index < 0 || index >= entry.tabs.length) {
+    await sock.sendMessage(group, {text:`Opção inválida. Responda com um número entre 1 e ${entry.tabs.length}.`, quoted:msg});
+    return true;
+  }
+  const title = entry.tabs[index];
+  if (!title || !['sent','selected'].includes(entry.status) || (entry.status === 'selected' && entry.tabTitle !== title)) return true;
+  if (!(await history.listTabs(sheets, spreadsheetId, {fresh:true})).includes(title)) {
+    confirmations.invalidateSelection(match[1]);
+    await sock.sendMessage(group, {text:'Essa aba não está mais disponível. Vou atualizar as opções.'});
+    await publishReview(sock, group, entry.sessionId, entry.proposal);
+    return true;
+  }
+  if (entry.status === 'sent' && !confirmations.choose(match[1], title)) return true;
+  const saved = await publishReview(sock, group, entry.sessionId, {...entry.proposal, tabTitle:title});
+  if (saved && msg.key.id) { markSeen(group, msg.key.id); saveSeenIds(); }
+  if (!saved) await sock.sendMessage(group, {text:'Não consegui gravar agora. Selecione a mesma aba novamente para tentar outra vez.'});
+  return true;
+}
+
 async function handleMessageInternal(sock, msg, options = {}) {
   const groupJid = msg.key.remoteJid || '';
   if (!groupJid.endsWith('@g.us') || msg.key.fromMe) return;
   if (allowedGroupJids.size && !allowedGroupJids.has(groupJid.toLowerCase())) return;
 
-  let text = getMessageText(msg.message).trim();
   const content = unwrapMessage(msg.message);
+  const rowId = content.listResponseMessage?.singleSelectReply?.selectedRowId;
+  if (rowId) {
+    if (!hasSeen(groupJid, msg.key.id)) await serializeConfirmations(groupJid, () => handleTabSelection(sock, msg, rowId));
+    return;
+  }
+  let text = getMessageText(msg.message).trim();
   const image = content.imageMessage;
   const document = content.documentMessage;
   const attachment = image || document;
@@ -682,6 +771,13 @@ async function handleMessageInternal(sock, msg, options = {}) {
 
     if (!attachment && !options.replay && !contextInfo.stanzaId) {
       const handled = await serializeConfirmations(groupJid, async () => {
+        const index = tabChoiceIndex(text);
+        const selections = index === null ? [] : (confirmations.openSelections?.(groupJid) || []);
+        if (selections.length === 1) return handleTabSelection(sock, msg, `tab:${selections[0][0]}:${index}`);
+        if (selections.length > 1) {
+          await sock.sendMessage(groupJid, {text:'Há mais de uma escolha de aba em aberto. Use “Responder” na mensagem do equipamento específico.', quoted:msg});
+          return true;
+        }
         const open = confirmations.latestOpen?.(groupJid) || [];
         if (!open.length) return false;
         const cleanText = stripMentions(text);

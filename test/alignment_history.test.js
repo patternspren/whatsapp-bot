@@ -123,5 +123,5 @@ test('mapeia títulos por nomes e distingue colunas repetidas pelo grupo', () =>
   assert.equal(mapped.cols.stationary_maker, 20);
   assert.equal(mapped.cols.comments, 23);
   const onlyStationary = mapHeaders([['Máquina Estacionária'], ['Maker']]);
-  assert.deepEqual(onlyStationary.cols, {stationary_maker:0});
+  assert.deepEqual(onlyStationary.cols, {stationary_maker:0, groupName:20});
 });

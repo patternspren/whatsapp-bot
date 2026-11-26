@@ -19,13 +19,13 @@ test('relatório com quatro geradores grava imediatamente e cobra campos faltant
       fileStore: () => ({ load() {}, save() {} }),
       makeGeminiFunctions: args => { onExtract = args.onExtract; return {}; }
     },
-    './confirmations': {createConfirmations: () => ({lookup: () => null, prepare: (group,sessionId,proposal) => {
+    './confirmations': {createConfirmations: () => ({selection: () => ['chosen',{status:'selected',tabTitle:'Modelo alinhamento'}], lookup: () => null, prepare: (group,sessionId,proposal) => {
       proposals.push({group,sessionId,proposal}); return {key:String(proposals.length),text:proposal.text};
     }}), parseCorrection: () => [], isApproval: () => false},
     './alignment_config': { loadAlignmentConfig: async () => ({}) },
     './alignment_history': {
       ...history, listTabs:async()=>['Modelo alinhamento'],
-      resolveRecordTarget: async (_sheets, _id, _data, sessionId) => ({status:'ready', target:{row:3, revision:sessionId, current:{}}, schema:[
+      resolveRecordTarget: async (_sheets, _id, _data, sessionId) => ({status:'ready', groupColumnAvailable:true, target:{row:3, revision:sessionId, current:{}}, schema:[
         {title:'Vessel',group:'',mappedAs:['vessel']},
         {title:'Equipment / Tag',group:'',mappedAs:['equipment']},
         {title:'Data',group:'History',mappedAs:['date']},

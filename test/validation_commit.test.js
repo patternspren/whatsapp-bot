@@ -23,6 +23,7 @@ function harness(entry, writeResult = {status:'updated',row:3}) {
       fileStore:()=>({load(){},save(){}}),makeGeminiFunctions:()=>({})
     },
     './confirmations':{...confirmationLib,createConfirmations:()=>({
+      selection:()=>null,
       lookup:(_group,id)=>proposals.get(id),done:(key,id)=>completed.push({key,id}),
       prepare:(_group,sessionId,draft)=>{
         const key='revised-key';
@@ -35,7 +36,7 @@ function harness(entry, writeResult = {status:'updated',row:3}) {
     './alignment_history':{
       ...historyLib, listTabs:async()=>['Modelo alinhamento'],
       getRecordSchema:async()=>schema,
-      resolveRecordTarget:async()=>({status:'ready', target:{row:3,revision:'latest',current:{}}, schema}),
+      resolveRecordTarget:async()=>({status:'ready', groupColumnAvailable:true, target:{row:3,revision:'latest',current:{}}, schema}),
       recordHistory:async(_sheets,_id,data,sessionId,options)=>{writes.push({data,sessionId,options});return writeResult;}
     }
   };
@@ -48,7 +49,7 @@ function harness(entry, writeResult = {status:'updated',row:3}) {
   return {handle:context.handle,writes,completed,replies,sock:{sendMessage:async(_group,message)=>{replies.push(message);return {key:{id:'bot-reply'}};}}};
 }
 
-const proposal=()=>({status:'sent',authorizedSender:'isabela@s.whatsapp.net',sessionId:'same-session',target:{row:3,revision:'initial'},startedAt:'2026-11-18T10:00:00.000Z',data:{
+const proposal=()=>({status:'sent',tabTitle:'Modelo alinhamento',authorizedSender:'isabela@s.whatsapp.net',sessionId:'same-session',target:{row:3,revision:'initial'},startedAt:'2026-11-18T10:00:00.000Z',data:{
   vessel:'BRAM Atlas',equipment:'MCP 1',axial_vertical:'usuário passou informação divergente'
 },conflicts:[{field:'Axial Vertical',caption:'-0.015 mm',visual:'-0.01 mm'}]});
 const reply=(text,stanzaId='proposal',id='response')=>({key:{remoteJid:'grupo@g.us',participant:'isabela@s.whatsapp.net',id},message:{extendedTextMessage:{text,contextInfo:{stanzaId}}}});

@@ -1,5 +1,5 @@
 {
-  "name": "whatsapp-alignment-collector",
+  "name": "whatsapp-bot-alignment",
   "version": "1.0.0",
   "description": "Coletor silencioso de mensagens de alinhamento para Google Sheets",
   "main": "index.js",
@@ -25,4 +25,3 @@
     "qrcode-terminal": "^0.12.0"
   }
 }
-
