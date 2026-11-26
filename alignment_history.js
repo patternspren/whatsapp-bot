@@ -2,9 +2,9 @@ const { createHash } = require('node:crypto');
 
 const cache = new WeakMap();
 const quoteTab = title => "'" + title.replace(/'/g, "''") + "'";
-async function listTabs(sheets, spreadsheetId) {
+async function listTabs(sheets, spreadsheetId, { fresh = false } = {}) {
   let entries = cache.get(sheets); if (!entries) { entries = new Map(); cache.set(sheets, entries); }
-  const saved = entries.get(spreadsheetId); if (saved && Date.now() - saved.at < 300000) return saved.titles;
+  const saved = entries.get(spreadsheetId); if (!fresh && saved && Date.now() - saved.at < 300000) return saved.titles;
   const {data} = await sheets.spreadsheets.get({spreadsheetId, fields:'sheets.properties(sheetId,title)'});
   const titles = (data.sheets || []).map(s => s.properties.title); entries.set(spreadsheetId, {titles, at:Date.now()}); return titles;
 }
@@ -74,6 +74,9 @@ function mapHeaders(rows) {
       if (stationary.length === 1) cols[key] = stationary[0];
     }
   }
+  // U is reserved for the WhatsApp group only if its header is empty or explicitly identifies it.
+  if ((!normalize(headers[20]) || normalize(headers[20]) === 'nome do grupo whatsapp') &&
+      !Object.values(cols).includes(20)) cols.groupName = 20;
   return { groups, headers, cols };
 }
 
@@ -195,7 +198,7 @@ async function resolveRecordTarget(sheets, spreadsheetId, data, sessionId, tabTi
   const schema = describeColumns(history.groups, history.headers, history.cols);
   const selected = selectRecordTarget(history, data, sessionId, tabTitle);
   if (selected.target) selected.target.tabTitle = tabTitle;
-  return { ...selected, schema };
+  return { ...selected, schema, groupColumnAvailable: history.cols.groupName === 20 };
 }
 
 async function recordHistory(sheets, spreadsheetId, data, sessionId, { target, confirmationId } = {}) {
@@ -229,6 +232,8 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { target, c
   if (row === null) commentParts.push(`recorded_at:${new Date().toISOString()}`);
   const values = Object.entries(cols).flatMap(([key, column]) => {
     const value = key === 'comments' ? commentParts.join(' | ') : data[key];
+    if (key === 'groupName' && !isKnown(value)) return [];
+    if (key === 'groupName' && isKnown(current.groupName)) return [];
     if (row === null) {
       return [{ column, value: String(isKnown(value) ? value : 'não informado') }];
     }
@@ -241,12 +246,12 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { target, c
   });
 
   if (row === null) {
-    const newValues = Array(headers.length).fill('');
+    const newValues = Array(Math.max(headers.length, ...Object.values(cols).map(i => i + 1))).fill('');
     for (const { column, value } of values) newValues[column] = value;
     const mappedCols = Object.values(cols);
     const firstCol = mappedCols.length ? Math.min(...mappedCols) : 0;
     const { data: appended } = await sheets.spreadsheets.values.append({
-      spreadsheetId, range: `${quoteTab(tabTitle)}!${columnLetter(firstCol + 1)}2:${columnLetter(headers.length)}`,
+      spreadsheetId, range: `${quoteTab(tabTitle)}!${columnLetter(firstCol + 1)}2:${columnLetter(newValues.length)}`,
       valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: [newValues.slice(firstCol)] }
     });
     const updatedRange = appended.updates?.updatedRange;

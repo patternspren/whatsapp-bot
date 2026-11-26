@@ -45,7 +45,7 @@ function createConfirmations(file) {
   }
   return {
     prepare(group, sessionId, proposal) {
-      const canonical = JSON.stringify({group, sessionId, data:proposal.data, conflicts:proposal.conflicts,
+      const canonical = JSON.stringify({group, sessionId, kind:proposal.kind, tabs:proposal.tabs, data:proposal.data, conflicts:proposal.conflicts,
         target:proposal.target?.revision, parentKey:proposal.parentKey, text:proposal.text});
       const key = crypto.createHash('sha256').update(canonical).digest('hex');
       if (Object.values(state).some(item => item.status === 'sent' && item.group === group && item.sessionId === sessionId &&
@@ -66,16 +66,41 @@ function createConfirmations(file) {
           item.status = 'superseded';
         }
       }
-      proposal.messageId = messageId;
+      proposal.messageIds = Array.isArray(messageId) ? messageId : [messageId];
+      proposal.messageId = proposal.messageIds[proposal.messageIds.length - 1];
       proposal.status = 'sent';
       save();
     },
     lookup(group, quotedId) {
-      return Object.entries(state).find(([,v]) => v.group===group && v.messageId===quotedId && ['sent','answered','superseded'].includes(v.status)) || null;
+      return Object.entries(state).find(([,v]) => v.group===group && (v.messageId===quotedId || v.messageIds?.includes(quotedId)) && ['sent','selected','answered','superseded'].includes(v.status)) || null;
+    },
+    selection(group, sessionId) {
+      return Object.entries(state).filter(([,v]) => v.group === group && v.sessionId === sessionId && v.kind === 'tab-selection' && v.status !== 'superseded')
+        .sort((a,b) => (b[1].createdAt || 0) - (a[1].createdAt || 0))[0] || null;
+    },
+    get(key) { return state[key] || null; },
+    invalidateSelection(key) {
+      if (state[key]?.kind === 'tab-selection') { state[key].status = 'superseded'; save(); }
+    },
+    refreshSelection(key, proposal) {
+      if (state[key]?.kind !== 'tab-selection' || state[key].status !== 'sent') return;
+      Object.assign(state[key], proposal);
+      save();
+    },
+    choose(key, tabTitle) {
+      if (!state[key] || state[key].kind !== 'tab-selection' || state[key].status !== 'sent' || !state[key].tabs.includes(tabTitle)) return false;
+      state[key].tabTitle = tabTitle;
+      state[key].status = 'selected';
+      save();
+      return true;
     },
     latestOpen(group) {
-      return Object.values(state).filter(v => v.group === group && v.status === 'sent' &&
+      return Object.values(state).filter(v => v.group === group && v.kind !== 'tab-selection' && v.status === 'sent' &&
         (!v.createdAt || Date.now() - v.createdAt <= 24 * 60 * 60 * 1000)).sort((a,b) => (b.createdAt || 0) - (a.createdAt || 0));
+    },
+    openSelections(group) {
+      return Object.entries(state).filter(([,v]) => v.group === group && v.kind === 'tab-selection' && v.status === 'sent' &&
+        (!v.createdAt || Date.now() - v.createdAt <= 24 * 60 * 60 * 1000)).sort((a,b) => (b[1].createdAt || 0) - (a[1].createdAt || 0));
     },
     done(key, responseId, status='answered', approvedBy='') {
       if (!state[key]) return;

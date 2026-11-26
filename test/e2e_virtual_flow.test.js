@@ -15,6 +15,7 @@ function createVirtualSheets(initialRows = null) {
     ['Vessel', 'Equipment / Tag', 'Maker', 'Data', 'Motivação', 'Executor', 'Axial Vertical', 'Axial Horizontal', 'Radial Vertical', 'Radial Horizontal', 'Coupling GAP', 'Comments']
   ];
   const rows = initialRows ? initialRows.map(r => [...r]) : heads.map(r => [...r]);
+  rows[1][20] = 'Nome do grupo whatsapp';
   const colToIndex = col => {
     let idx = 0;
     for (const ch of col) idx = idx * 26 + (ch.charCodeAt(0) - 64);
@@ -101,6 +102,8 @@ function bootVirtualBot({ env = {}, fetchHandler, sheets, initialRows = null, ba
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wpp-e2e-'));
   const virtualSheets = sheets ? { sheets, rows: initialRows } : createVirtualSheets(initialRows);
   const sentMessages = [];
+  const pendingSelections = [];
+  const lastSender = new Map();
   const consoleErrors = [];
   let messageSeq = 0;
   const origFetch = global.fetch;
@@ -114,14 +117,26 @@ function bootVirtualBot({ env = {}, fetchHandler, sheets, initialRows = null, ba
     sendMessage: async (group, message) => {
       messageSeq += 1;
       const id = `bot-msg-${messageSeq}`;
-      sentMessages.push({ group, id, ...message });
+      if (/Se a lista interativa não aparecer/.test(message.text || '')) { /* alternativa de seleção */ }
+      else if (message.sections) {
+        const rows = message.sections[0].rows;
+        const selected = /gerador de eixo/i.test(message.text) ? rows.find(r => /Shaft gen/.test(r.description)) : rows[0];
+        pendingSelections.push({group, rowId:(selected || rows[0]).rowId});
+      } else sentMessages.push({ group, id, ...message });
       return { key: { id, remoteJid: group } };
+    },
+    relayMessage: async (group, message) => {
+      const list = message.listMessage;
+      const rows = list.sections[0].rows;
+      const selected = /gerador de eixo/i.test(list.description) ? rows.find(r => /Shaft gen/.test(r.description)) : rows[0];
+      pendingSelections.push({group, rowId:(selected || rows[0]).rowId});
     },
     updateMediaMessage: async (msg) => msg
   };
 
   const events = {};
   const fakeBaileys = baileysOverride || {
+    generateWAMessageFromContent: (group,message) => ({key:{id:`list-${++messageSeq}`,remoteJid:group},message}),
     default: () => ({
       ...sock,
       ev: {
@@ -192,6 +207,14 @@ function bootVirtualBot({ env = {}, fetchHandler, sheets, initialRows = null, ba
   );
   context.setSock(sock);
 
+  async function choosePending() {
+    while (pendingSelections.length) {
+      const {group, rowId} = pendingSelections.shift();
+      await context.handle(sock, {key:{remoteJid:group,id:`selection-${++messageSeq}`,participant:lastSender.get(group) || 'user@s.whatsapp.net'},
+        message:{listResponseMessage:{singleSelectReply:{selectedRowId:rowId}}}});
+    }
+  }
+
   return {
     tmpDir,
     sock,
@@ -200,8 +223,8 @@ function bootVirtualBot({ env = {}, fetchHandler, sheets, initialRows = null, ba
     consoleErrors,
     rows: virtualSheets.rows,
     sheets: virtualSheets.sheets,
-    handle: (msg) => context.handle(sock, msg),
-    tick: () => context.tracker.tick(),
+    handle: async (msg) => { lastSender.set(msg.key.remoteJid, msg.key.participant); await context.handle(sock, msg); await choosePending(); },
+    tick: async () => { await context.tracker.tick(); await choosePending(); },
     startBot: () => context.startBot(),
     cleanup: () => {
       global.fetch = origFetch;
